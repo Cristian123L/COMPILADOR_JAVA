@@ -5,15 +5,6 @@ from backend.entities.optimization_row import OptimizationRow
 
 
 class OptimizerEngine:
-    """
-    Aplica optimizaciones locales y derivadas de la Unidad 3 (U3 OPTIMIZACIÓN GB):
-      - FO / FOD : Folding
-      - PC / PCD : Propagación de Constantes (incluyendo literales char como '@' -> 64)
-      - SE / SED : Simplificación de Expresiones
-      - RS / RSD : Reducción de Subexpresiones Comunes
-      - CM / CMD : Código Muerto
-    """
-
     NUMBER_RE = re.compile(r"^-?\d+(?:\.\d+)?[fF]?$")
     CHAR_RE = re.compile(r"^'(?:\\.|[^'])'$")
 

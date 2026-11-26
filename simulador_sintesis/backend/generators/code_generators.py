@@ -56,14 +56,6 @@ class ExecStepNode:
 
 
 class IntermediateCodeGenerator:
-    """
-    Genera Códigos Intermedios recorriendo el Árbol Abstracto-Semántico:
-      - Triplos:          n. (val1, ope, val2) + ID1 PMAIN -> [n]
-      - Cuádruplos:       n. (val1, ope, val2, res) + ID1 PMAIN -> [n]
-      - Tres Direcciones: Tn. (val1, ope, val2) con 1 <= n <= 3,
-                          dejando operaciones pendientes hasta liberar temporales.
-    """
-
     def _build_bottom_up_plan(
         self,
         instructions: List[IRInstruction],
@@ -392,14 +384,7 @@ class IntermediateCodeGenerator:
         instructions: List[IRInstruction],
         main_class_id: str = "ID1",
     ) -> Tuple[List[TresDirecciones], str]:
-        """
-        Genera Código de Tres Direcciones restringido estrictamente a 3 registros (1 <= n <= 3):
-          - Deja operaciones pendientes hasta liberar temporales (T1 -> T2 -> T3).
-          - Un registro consumido en una operación no se sobrescribe en esa misma línea,
-            pero queda libre inmediatamente después para las operaciones pendientes.
-          - Las asignaciones a ID (`IDx = Tn`) y las salidas/retornos (`Tn. (IDx, SOUT/RTN, Tm)`)
-            liberan los temporales utilizados.
-        """
+        
         plan = self._build_bottom_up_plan(instructions, defer_pending_for_3dir=True)
         salida: List[TresDirecciones] = []
         in_use: Set[int] = set()
