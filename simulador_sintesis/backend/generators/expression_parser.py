@@ -14,7 +14,6 @@ class ExprNode:
         return self.left is None and self.right is None
 
     def required_registers(self) -> int:
-        """Número de Sethi-Ullman para minimizar registros temporales (1 <= n <= 3)."""
         if self.is_leaf:
             return 1
         l_req = self.left.required_registers() if self.left else 0
@@ -25,15 +24,33 @@ class ExprNode:
 
 
 class ExpressionParser:
-    PRECEDENCE = {"+": 1, "-": 1, "*": 2, "/": 2, "%": 2}
-    TOKEN_REGEX = re.compile(r"\d+\.\d+|\d+|[A-Za-z_]\w*|[+\-*/%()]")
+    PRECEDENCE = {"+": 1, "-": 1, "*": 2, "/": 2, "%": 2, ".": 3}
+
+    TOKEN_REGEX = re.compile(
+        r'"[^"]*"|\'[^\']*\'|\d+\.\d+[fF]?|\d+[fF]?|\+\+|--|[A-Za-z_]\w*(?:\(\))?|[+\-*/%.()]'
+    )
+
+    @classmethod
+    def preprocess_sugar(cls, expr: str) -> str:
+        # Eliminar casts explícitos (float), (double), (int), (char) dejando el árbol limpio
+        expr = re.sub(r"\(\s*(?:float|double|int|char|long|short|byte)\s*\)", "", expr)
+        # Normalizar Math.random() -> Math . random()
+        expr = re.sub(r"\bMath\s*\.\s*random\s*\(\s*\)", "Math . random()", expr)
+        # Normalizar .length() -> . length()
+        expr = re.sub(r"\.\s*length\s*\(\s*\)", " . length()", expr)
+        # ++ID2 o ID2++ -> (1 + ID2) tal como en Unidad 2
+        expr = re.sub(r"\+\+\s*(ID\d+|[A-Za-z_]\w*)", r"(1 + \1)", expr)
+        expr = re.sub(r"(ID\d+|[A-Za-z_]\w*)\s*\+\+", r"(\1 + 1)", expr)
+        expr = re.sub(r"--\s*(ID\d+|[A-Za-z_]\w*)", r"(\1 - 1)", expr)
+        expr = re.sub(r"(ID\d+|[A-Za-z_]\w*)\s*--", r"(\1 - 1)", expr)
+        return expr.strip()
 
     @classmethod
     def tokenize(cls, expr: str) -> List[str]:
+        expr = cls.preprocess_sugar(expr)
         raw_tokens = cls.TOKEN_REGEX.findall(expr)
         tokens: List[str] = []
         for i, tok in enumerate(raw_tokens):
-            # Manejar signo unario negativo (ej: -5 o (-x))
             if tok == "-" and (i == 0 or raw_tokens[i - 1] in ("(", "+", "-", "*", "/", "%")):
                 tokens.append("0")
                 tokens.append("-")

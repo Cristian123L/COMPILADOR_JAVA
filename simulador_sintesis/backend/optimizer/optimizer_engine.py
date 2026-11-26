@@ -6,21 +6,21 @@ from backend.entities.optimization_row import OptimizationRow
 
 class OptimizerEngine:
     """
-    Aplica las optimizaciones locales de la Unidad 3 (Mtra. Nancy Carolina Quintana):
-      - FO  / FOD : Folding (operaciones entre constantes)
-      - PC  / PCD : Propagación de Constantes
-      - SE  / SED : Simplificación de Expresiones (+0, -0, *1, /1, *0, etc.)
-      - RS  / RSD : Reducción de Subexpresiones Comunes
-      - CM  / CMD : Código Muerto (variables/registros no utilizados)
+    Aplica optimizaciones locales y derivadas de la Unidad 3 (U3 OPTIMIZACIÓN GB):
+      - FO / FOD : Folding
+      - PC / PCD : Propagación de Constantes (incluyendo literales char como '@' -> 64)
+      - SE / SED : Simplificación de Expresiones
+      - RS / RSD : Reducción de Subexpresiones Comunes
+      - CM / CMD : Código Muerto
     """
 
-    NUMBER_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
+    NUMBER_RE = re.compile(r"^-?\d+(?:\.\d+)?[fF]?$")
+    CHAR_RE = re.compile(r"^'(?:\\.|[^'])'$")
 
-    def optimize_cuadruplos(self, cuadruplos: List[Cuadruplo]) -> Tuple[List[OptimizationRow], List[Cuadruplo]]:
+    def optimize_cuadruplos(self, cuadruplos: List[Cuadruplo]) -> List[OptimizationRow]:
         if not cuadruplos:
-            return [], []
+            return []
 
-        # Clonar instrucciones en una representación mutable interna
         ops = [
             {
                 "orig_idx": c.indice,
@@ -33,12 +33,42 @@ class OptimizerEngine:
                 "affected": set(),
                 "eliminated": False,
                 "modified_by_cascade": False,
-                "reason_detail": "",
             }
             for c in cuadruplos
         ]
 
-        # Pasadas iterativas hasta alcanzar punto fijo (permite detectar derivadas con 'D')
+        self._run_optimization_passes(ops)
+        return self._build_rows(ops, is_triplo=False)
+
+    def optimize_triplos(self, triplos: List[Triplo]) -> List[OptimizationRow]:
+        if not triplos:
+            return []
+
+        ops = [
+            {
+                "orig_idx": t.indice,
+                "orig_str": str(t),
+                "val1": t.val1,
+                "ope": t.ope,
+                "val2": t.val2,
+                "res": "",
+                "acronym": "-",
+                "affected": set(),
+                "eliminated": False,
+                "modified_by_cascade": False,
+            }
+            for t in triplos
+        ]
+
+        self._run_optimization_passes(ops)
+        return self._build_rows(ops, is_triplo=True)
+
+    def _run_optimization_passes(self, ops: List[dict]) -> None:
+        assign_counts: Dict[str, int] = {}
+        for inst in ops:
+            if inst["ope"] == "=":
+                assign_counts[inst["val1"]] = assign_counts.get(inst["val1"], 0) + 1
+
         changed = True
         pass_num = 0
         while changed:
@@ -46,55 +76,67 @@ class OptimizerEngine:
             pass_num += 1
             is_derived = pass_num > 1
 
-            const_map: Dict[str, str] = {}          # var/temp -> literal constante
-            const_origin: Dict[str, int] = {}        # var/temp -> índice original que la definió
-            expr_map: Dict[Tuple[str, str, str], Tuple[str, int]] = {}  # (v1, op, v2) -> (res, orig_idx)
+            const_map: Dict[str, Tuple[str, int]] = {}
+            alias_map: Dict[str, Tuple[str, int]] = {}
+            expr_map: Dict[Tuple[str, str, str], Tuple[str, int]] = {}
 
             for i, inst in enumerate(ops):
                 if inst["eliminated"]:
                     continue
 
-                v1, ope, v2, res = inst["val1"], inst["ope"], inst["val2"], inst["res"]
-
-                # 1. Propagación de Constantes (PC / PCD) hacia los operandos de esta fila
+                v1, ope, v2 = inst["val1"], inst["ope"], inst["val2"]
+                ref_token = f"[{inst['orig_idx']}]"
                 propagated_here = False
-                if v1 in const_map:
-                    origin_i = const_origin[v1]
-                    inst["val1"] = const_map[v1]
-                    v1 = inst["val1"]
-                    ops[origin_i]["affected"].add(str(inst["orig_idx"]))
-                    if ops[origin_i]["acronym"] == "-":
-                        ops[origin_i]["acronym"] = "PCD" if ops[origin_i]["modified_by_cascade"] else "PC"
-                    ops[origin_i]["eliminated"] = True
+
+                if ope != "=" and v1 in alias_map:
+                    new_v1, src_i = alias_map[v1]
+                    inst["val1"] = new_v1
+                    v1 = new_v1
+                    ops[src_i]["affected"].add(str(inst["orig_idx"]))
+                    inst["modified_by_cascade"] = True
+                    changed = True
+
+                if v2 in alias_map:
+                    new_v2, src_i = alias_map[v2]
+                    inst["val2"] = new_v2
+                    v2 = new_v2
+                    ops[src_i]["affected"].add(str(inst["orig_idx"]))
+                    inst["modified_by_cascade"] = True
+                    changed = True
+
+                # 1. Propagación de Constantes (PC / PCD)
+                if ope != "=" and v1 in const_map:
+                    c_val, src_i = const_map[v1]
+                    inst["val1"] = c_val
+                    v1 = c_val
+                    ops[src_i]["affected"].add(str(inst["orig_idx"]))
+                    if ops[src_i]["acronym"] == "-":
+                        ops[src_i]["acronym"] = "PCD" if ops[src_i]["modified_by_cascade"] else "PC"
+                    ops[src_i]["eliminated"] = True
                     inst["modified_by_cascade"] = True
                     propagated_here = True
                     changed = True
 
-                if ope != "=" and v2 in const_map:
-                    origin_i = const_origin[v2]
-                    inst["val2"] = const_map[v2]
-                    v2 = inst["val2"]
-                    ops[origin_i]["affected"].add(str(inst["orig_idx"]))
-                    if ops[origin_i]["acronym"] == "-":
-                        ops[origin_i]["acronym"] = "PCD" if ops[origin_i]["modified_by_cascade"] else "PC"
-                    ops[origin_i]["eliminated"] = True
+                if v2 in const_map:
+                    c_val, src_i = const_map[v2]
+                    inst["val2"] = c_val
+                    v2 = c_val
+                    ops[src_i]["affected"].add(str(inst["orig_idx"]))
+                    if ops[src_i]["acronym"] == "-":
+                        ops[src_i]["acronym"] = "PCD" if ops[src_i]["modified_by_cascade"] else "PC"
+                    ops[src_i]["eliminated"] = True
                     inst["modified_by_cascade"] = True
                     propagated_here = True
                     changed = True
 
-                # 2. Folding (FO / FOD): ambos operandos son constantes numéricas
+                # 2. Folding (FO / FOD)
                 if ope in ("+", "-", "*", "/", "%") and self._is_number(v1) and self._is_number(v2):
-                    folded_val = self._eval_constant(v1, ope, v2)
-                    if folded_val is not None:
+                    folded = self._eval_constant(v1, ope, v2)
+                    if folded is not None:
                         tag = "FOD" if (is_derived or inst["modified_by_cascade"] or propagated_here) else "FO"
                         inst["acronym"] = tag
                         inst["eliminated"] = True
-                        const_map[res] = folded_val
-                        const_origin[res] = i
-                        # Buscar dónde se usa 'res' para marcar afectado
-                        for j in range(i + 1, len(ops)):
-                            if not ops[j]["eliminated"] and res in (ops[j]["val1"], ops[j]["val2"]):
-                                inst["affected"].add(str(ops[j]["orig_idx"]))
+                        const_map[ref_token] = (folded, i)
                         changed = True
                         continue
 
@@ -102,31 +144,14 @@ class OptimizerEngine:
                 if ope in ("+", "-", "*", "/"):
                     simp = self._simplify_expression(v1, ope, v2)
                     if simp is not None:
-                        kind, simplified_val = simp
+                        kind, simp_val = simp
                         tag = "SED" if (is_derived or inst["modified_by_cascade"] or propagated_here) else "SE"
                         inst["acronym"] = tag
+                        inst["eliminated"] = True
                         if kind == "ZERO":
-                            inst["eliminated"] = True
-                            const_map[res] = "0"
-                            const_origin[res] = i
-                            for j in range(i + 1, len(ops)):
-                                if not ops[j]["eliminated"] and res in (ops[j]["val1"], ops[j]["val2"]):
-                                    inst["affected"].add(str(ops[j]["orig_idx"]))
-                        elif kind == "IDENTITY":
-                            # Ej: x + 0 -> x, x * 1 -> x, x / 1 -> x
-                            inst["eliminated"] = True
-                            # Reemplazar el temporal 'res' por 'simplified_val' en instrucciones posteriores
-                            for j in range(i + 1, len(ops)):
-                                if ops[j]["eliminated"]:
-                                    continue
-                                if ops[j]["val1"] == res:
-                                    ops[j]["val1"] = simplified_val
-                                    ops[j]["modified_by_cascade"] = True
-                                    inst["affected"].add(str(ops[j]["orig_idx"]))
-                                if ops[j]["val2"] == res:
-                                    ops[j]["val2"] = simplified_val
-                                    ops[j]["modified_by_cascade"] = True
-                                    inst["affected"].add(str(ops[j]["orig_idx"]))
+                            const_map[ref_token] = ("0", i)
+                        else:
+                            alias_map[ref_token] = (simp_val, i)
                         changed = True
                         continue
 
@@ -134,93 +159,78 @@ class OptimizerEngine:
                 if ope in ("+", "-", "*", "/", "%"):
                     key = (v1, ope, v2) if ope not in ("+", "*") else tuple(sorted([v1, v2])) + (ope,)
                     if key in expr_map:
-                        prev_res, prev_i = expr_map[key]
+                        prev_ref, prev_i = expr_map[key]
                         if not ops[prev_i]["eliminated"]:
                             tag = "RSD" if (is_derived or inst["modified_by_cascade"]) else "RS"
                             inst["acronym"] = tag
                             inst["eliminated"] = True
-                            for j in range(i + 1, len(ops)):
-                                if ops[j]["eliminated"]:
-                                    continue
-                                if ops[j]["val1"] == res:
-                                    ops[j]["val1"] = prev_res
-                                    ops[j]["modified_by_cascade"] = True
-                                    inst["affected"].add(str(ops[j]["orig_idx"]))
-                                if ops[j]["val2"] == res:
-                                    ops[j]["val2"] = prev_res
-                                    ops[j]["modified_by_cascade"] = True
-                                    inst["affected"].add(str(ops[j]["orig_idx"]))
+                            alias_map[ref_token] = (prev_ref, i)
                             changed = True
                             continue
                     else:
-                        expr_map[key] = (res, i)
+                        expr_map[key] = (ref_token, i)
 
-                # Registrar constante directa para propagación (ej: base = 10)
-                if ope == "=" and self._is_number(v1):
-                    const_map[res] = v1
-                    const_origin[res] = i
-                elif ope == "=" and res in const_map:
-                    # Si la variable se reasigna con algo no constante, deja de ser constante
-                    del const_map[res]
-                    const_origin.pop(res, None)
+                # Registrar constante asignada a IDx y a su referencia [k] (numérica o carácter como '@')
+                if ope == "=" and assign_counts.get(v1, 0) == 1:
+                    const_val = self._extract_constant_value(v2, inst["res"])
+                    if const_val is not None:
+                        const_map[v1] = (const_val, i)
+                        const_map[ref_token] = (const_val, i)
 
-        # 5. Código Muerto (CM / CMD): instrucciones cuya variable destino nunca se vuelve a leer
+        # 5. Código Muerto (CM / CMD)
         dead_pass = True
         while dead_pass:
             dead_pass = False
-            used_symbols = set()
+            used_refs = set()
             for inst in ops:
                 if inst["eliminated"]:
                     continue
-                if inst["ope"] == "SOUT":
-                    used_symbols.add(inst["val1"])
+                if inst["ope"] == "=":
+                    used_refs.add(inst["val2"])
                 else:
-                    if inst["val1"] and inst["val1"] != "-":
-                        used_symbols.add(inst["val1"])
-                    if inst["val2"] and inst["val2"] != "-":
-                        used_symbols.add(inst["val2"])
+                    used_refs.add(inst["val1"])
+                    used_refs.add(inst["val2"])
 
             for inst in ops:
-                if inst["eliminated"] or inst["ope"] == "SOUT":
+                if inst["eliminated"]:
                     continue
-                target = inst["res"]
-                if target not in used_symbols:
+                ref_token = f"[{inst['orig_idx']}]"
+                if inst["ope"] == "=" and inst["val1"] not in used_refs and ref_token not in used_refs:
                     inst["acronym"] = "CMD" if inst["modified_by_cascade"] else "CM"
                     inst["eliminated"] = True
                     dead_pass = True
 
-        # Construir filas de la tabla de optimización (Inciso 4)
+    def _build_rows(self, ops: List[dict], is_triplo: bool) -> List[OptimizationRow]:
         rows: List[OptimizationRow] = []
-        optimized_cuadruplos: List[Cuadruplo] = []
         new_idx = 1
 
         for inst in ops:
             afectados = ", ".join(sorted(inst["affected"], key=lambda x: int(x))) if inst["affected"] else "-"
 
             if inst["eliminated"]:
-                # Mostrar cómo quedó antes de eliminarse si tuvo cambio previo, seguido de ELIMINAR
                 if inst["modified_by_cascade"]:
-                    prev_text = f"{new_idx}. ({inst['val1']}, {inst['ope']}, {inst['val2']}, {inst['res']}) -> ELIMINAR"
+                    if is_triplo:
+                        preview = f"{new_idx}. ({inst['val1']}, {inst['ope']}, {inst['val2']}) -> ELIMINAR"
+                    else:
+                        preview = f"{new_idx}. ({inst['val1']}, {inst['ope']}, {inst['val2']}, {inst['res']}) -> ELIMINAR"
                 else:
-                    prev_text = "ELIMINAR"
+                    preview = "ELIMINAR"
+
                 rows.append(
                     OptimizationRow(
                         cuadruplo_original=inst["orig_str"],
                         acronimo_optimizacion=inst["acronym"],
                         cuadruplo_afectado=afectados,
-                        cuadruplo_modificado=prev_text,
+                        cuadruplo_modificado=preview,
                     )
                 )
             else:
-                new_c = Cuadruplo(
-                    indice=new_idx,
-                    val1=inst["val1"],
-                    ope=inst["ope"],
-                    val2=inst["val2"],
-                    res=inst["res"],
-                )
-                optimized_cuadruplos.append(new_c)
-                mod_text = str(new_c) if (inst["modified_by_cascade"] or new_idx != inst["orig_idx"]) else "-"
+                if is_triplo:
+                    new_str = f"{new_idx}. ({inst['val1']}, {inst['ope']}, {inst['val2']})"
+                else:
+                    new_str = f"{new_idx}. ({inst['val1']}, {inst['ope']}, {inst['val2']}, {inst['res']})"
+
+                mod_text = new_str if (inst["modified_by_cascade"] or new_idx != inst["orig_idx"]) else "-"
                 rows.append(
                     OptimizationRow(
                         cuadruplo_original=inst["orig_str"],
@@ -231,60 +241,30 @@ class OptimizerEngine:
                 )
                 new_idx += 1
 
-        return rows, optimized_cuadruplos
-
-    def optimize_triplos(self, triplos: List[Triplo], cuadruplos_equiv: List[Cuadruplo]) -> List[OptimizationRow]:
-        """
-        Optimiza Triplos reutilizando el análisis de flujo de datos y mapeando
-        cada fila al formato n(val1, ope, val2).
-        """
-        cuad_rows, _ = self.optimize_cuadruplos(cuadruplos_equiv)
-        rows: List[OptimizationRow] = []
-
-        for idx, t in enumerate(triplos):
-            if idx < len(cuad_rows):
-                cr = cuad_rows[idx]
-                mod = cr.cuadruplo_modificado
-                if mod not in ("-", "ELIMINAR") and "-> ELIMINAR" not in mod:
-                    # Convertir el cuádruplo reescrito a formato triplo n(v1, op, v2)
-                    mod = self._cuadruplo_str_to_triplo_str(mod, t)
-                rows.append(
-                    OptimizationRow(
-                        cuadruplo_original=str(t),
-                        acronimo_optimizacion=cr.acronimo_optimizacion,
-                        cuadruplo_afectado=cr.cuadruplo_afectado,
-                        cuadruplo_modificado=mod,
-                    )
-                )
-            else:
-                rows.append(
-                    OptimizationRow(
-                        cuadruplo_original=str(t),
-                        acronimo_optimizacion="-",
-                        cuadruplo_afectado="-",
-                        cuadruplo_modificado="-",
-                    )
-                )
         return rows
 
-    def _cuadruplo_str_to_triplo_str(self, cuad_str: str, orig_triplo: Triplo) -> str:
-        m = re.match(r"^(\d+)\.\s*\(([^,]+),\s*([^,]+),\s*([^,]+),\s*([^)]+)\)$", cuad_str.strip())
-        if not m:
-            return str(orig_triplo)
-        n, v1, ope, v2, res = m.groups()
-        if ope == "=":
-            return f"{n}({res}, =, {v1})"
-        if ope == "SOUT":
-            return f"{n}(SOUT, print, {v1})"
-        return f"{n}({v1}, {ope}, {v2})"
+    def _strip_f(self, tok: str) -> str:
+        return tok[:-1] if tok.lower().endswith("f") else tok
 
     def _is_number(self, token: str) -> bool:
         return bool(self.NUMBER_RE.match(token.strip()))
 
+    def _extract_constant_value(self, val2: str, res_col: str) -> Optional[str]:
+        tok = val2.strip()
+        if self._is_number(tok):
+            return self._strip_f(tok)
+        if self.CHAR_RE.match(tok):
+            if res_col and self._is_number(res_col):
+                return self._strip_f(res_col)
+            inner = tok[1:-1]
+            ch = "\0" if inner == "\\0" else inner[0]
+            return str(ord(ch))
+        return None
+
     def _eval_constant(self, v1: str, ope: str, v2: str) -> Optional[str]:
         try:
-            a = float(v1)
-            b = float(v2)
+            a = float(self._strip_f(v1))
+            b = float(self._strip_f(v2))
             if ope == "+":
                 res = a + b
             elif ope == "-":
@@ -304,32 +284,33 @@ class OptimizerEngine:
 
             if res.is_integer():
                 return str(int(res))
-            return f"{res:.4f}".rstrip("0").rstrip(".")
+            return f"{res:.6f}".rstrip("0").rstrip(".")
         except ValueError:
             return None
 
     def _simplify_expression(self, v1: str, ope: str, v2: str) -> Optional[Tuple[str, str]]:
-        # Operaciones neutras / simplificables (Diapositiva 12)
+        n1 = self._strip_f(v1)
+        n2 = self._strip_f(v2)
         if ope == "+":
-            if v2 == "0":
+            if n2 in ("0", "0.0"):
                 return ("IDENTITY", v1)
-            if v1 == "0":
+            if n1 in ("0", "0.0"):
                 return ("IDENTITY", v2)
         elif ope == "-":
-            if v2 == "0":
+            if n2 in ("0", "0.0"):
                 return ("IDENTITY", v1)
             if v1 == v2:
                 return ("ZERO", "0")
         elif ope == "*":
-            if v2 == "1":
+            if n2 in ("1", "1.0"):
                 return ("IDENTITY", v1)
-            if v1 == "1":
+            if n1 in ("1", "1.0"):
                 return ("IDENTITY", v2)
-            if v1 == "0" or v2 == "0":
+            if n1 in ("0", "0.0") or n2 in ("0", "0.0"):
                 return ("ZERO", "0")
         elif ope == "/":
-            if v2 == "1":
+            if n2 in ("1", "1.0"):
                 return ("IDENTITY", v1)
-            if v1 == "0" and v2 != "0":
+            if n1 in ("0", "0.0") and n2 not in ("0", "0.0"):
                 return ("ZERO", "0")
         return None

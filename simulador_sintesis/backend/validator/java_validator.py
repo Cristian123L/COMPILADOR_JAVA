@@ -1,152 +1,839 @@
 import re
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set, Tuple
+from backend.entities.symbol_entry import SymbolEntry
 from backend.entities.validation_result import ValidationResult
+
+
+@dataclass
+class IRInstruction:
+    """Instrucción intermedia normalizada con IDs resueltos por ámbito."""
+    kind: str                  # ASSIGN, SOUT, RTN, CALL, CALL_SOUT
+    target_id: str             # Ej. ID2, PMAIN, ID4
+    target_type: str           # int, float, double, char, String, boolean, void
+    expr: str                  # Expresión con nombres originales reescritos a IDx
+    scope: str                 # Global o nombre del método
+    method_owner_id: str = ""  # ID del método si pertenece a un método auxiliar
+
+
+@dataclass
+class ExtendedValidationResult(ValidationResult):
+    symbols: List[SymbolEntry] = field(default_factory=list)
+    instructions: List[IRInstruction] = field(default_factory=list)
+    main_class_id: str = "ID1"
+    error_line: Optional[int] = None
 
 
 class JavaValidator:
     """
-    Valida que el código de entrada sea una clase principal de Java depurada
-    antes de permitir la generación de código intermedio.
+    Valida sintaxis/semántica básica de Java (GLC Unidad 1/2) y construye la
+    Tabla de Símbolos (ID1, ID2...) diferenciando ámbito Global vs. Local.
     """
 
     VALID_TYPES = {"int", "double", "float", "long", "short", "byte", "boolean", "char", "String"}
+    RETURN_TYPES = VALID_TYPES | {"void"}
+    RESERVED = VALID_TYPES | {
+        "public", "private", "protected", "static", "final", "class", "void",
+        "new", "return", "if", "else", "while", "for", "System", "out",
+        "println", "print", "Math", "random", "length", "charAt", "true", "false", "null"
+    }
 
-    def validate(self, source_code: str) -> ValidationResult:
-        errors = []
+    DEFAULT_VALUES = {
+        "int": "0",
+        "long": "0",
+        "short": "0",
+        "byte": "0",
+        "float": "0.0f",
+        "double": "0.0",
+        "char": "'\\0'",
+        "boolean": "false",
+        "String": '""',
+    }
+
+    def validate(self, source_code: str) -> ExtendedValidationResult:
         if not source_code or not source_code.strip():
-            return ValidationResult(is_valid=False, errors=["El editor de código está vacío."])
+            return ExtendedValidationResult(
+                is_valid=False,
+                errors=["El editor de código está vacío."],
+                error_line=1,
+            )
 
-        clean_code = self._strip_comments(source_code)
+        clean_code = self._strip_comments_preserve_lines(source_code)
+
+        illegal_line = self._find_illegal_chars(clean_code)
+        if illegal_line is not None:
+            return ExtendedValidationResult(
+                is_valid=False,
+                errors=[f"Error léxico en línea {illegal_line}: símbolo no reconocido por el lenguaje Java."],
+                error_line=illegal_line,
+            )
 
         if clean_code.count("{") != clean_code.count("}"):
-            errors.append("Error de sintaxis: llaves '{' y '}' desbalanceadas.")
+            return ExtendedValidationResult(
+                is_valid=False,
+                errors=["Error sintáctico: llaves '{' y '}' desbalanceadas."],
+                error_line=self._find_unbalanced_line(clean_code, "{", "}"),
+            )
         if clean_code.count("(") != clean_code.count(")"):
-            errors.append("Error de sintaxis: paréntesis '(' y ')' desbalanceados.")
+            return ExtendedValidationResult(
+                is_valid=False,
+                errors=["Error sintáctico: paréntesis '(' y ')' desbalanceados."],
+                error_line=self._find_unbalanced_line(clean_code, "(", ")"),
+            )
 
-        if errors:
-            return ValidationResult(is_valid=False, errors=errors)
-
-        class_match = re.search(
-            r"\bpublic\s+class\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{",
-            clean_code
-        )
+        class_match = re.search(r"\bpublic\s+class\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{", clean_code)
         if not class_match:
-            errors.append("No se encontró una declaración válida de clase principal ('public class Nombre {').")
-            return ValidationResult(is_valid=False, errors=errors)
+            return ExtendedValidationResult(
+                is_valid=False,
+                errors=["Error sintáctico (regla CLASE): falta 'public class NombreClase {'."],
+                error_line=1,
+            )
 
         class_name = class_match.group(1)
+        class_open = class_match.end() - 1
+        class_close = self._find_matching_brace(clean_code, class_open)
+        if class_close is None:
+            return ExtendedValidationResult(
+                is_valid=False,
+                errors=["Error sintáctico: no se encontró llave de cierre '}' de la clase principal."],
+                error_line=clean_code[:class_open].count("\n") + 1,
+            )
+
+        before_class = clean_code[:class_match.start()].strip()
+        for raw_l in before_class.splitlines():
+            s = raw_l.strip()
+            if not s:
+                continue
+            if not (re.match(r"^package\s+[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\s*;$", s) or
+                    re.match(r"^import\s+[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*(?:\.\*)?\s*;$", s)):
+                err_l = self._line_of_snippet(clean_code, s)
+                return ExtendedValidationResult(
+                    is_valid=False,
+                    errors=[f"Error sintáctico en línea {err_l}: sentencia inválida fuera de la clase ('{s}')."],
+                    error_line=err_l,
+                )
 
         main_pattern = re.compile(
-            r"\bpublic\s+static\s+void\s+main\s*\(\s*String\s*(?:\[\s*\]\s*[A-Za-z_]\w*|[A-Za-z_]\w*\s*\[\s*\])\s*\)\s*\{"
+            r"\bpublic\s+static\s+void\s+main\s*\(\s*String\s*(?:\[\s*\]\s*([A-Za-z_]\w*)|([A-Za-z_]\w*)\s*\[\s*\])\s*\)\s*\{"
         )
-        main_match = main_pattern.search(clean_code)
+        main_match = main_pattern.search(clean_code, class_open, class_close)
         if not main_match:
-            errors.append("La clase principal debe contener el método 'public static void main(String[] args)'.")
-            return ValidationResult(is_valid=False, class_name=class_name, errors=errors)
+            return ExtendedValidationResult(
+                is_valid=False,
+                class_name=class_name,
+                errors=["Error sintáctico (regla MAIN): falta el método 'public static void main(String[] args)'."],
+                error_line=clean_code[:class_open].count("\n") + 1,
+            )
 
-        main_body = self._extract_block_content(clean_code, main_match.end() - 1)
-        if main_body is None:
-            errors.append("No se pudo delimitar el bloque del método main.")
-            return ValidationResult(is_valid=False, class_name=class_name, errors=errors)
+        symbols: List[SymbolEntry] = []
+        id_counter = 1
 
-        cleaned_statements = self._validate_statements(main_body, errors)
+        def next_id() -> str:
+            nonlocal id_counter
+            val = f"ID{id_counter}"
+            id_counter += 1
+            return val
 
-        if errors:
-            return ValidationResult(is_valid=False, class_name=class_name, errors=errors)
+        main_class_id = next_id()
+        symbols.append(
+            SymbolEntry(
+                id_code=main_class_id,
+                lexeme=class_name,
+                category="Clase Principal",
+                data_type="class",
+                scope="Global",
+            )
+        )
 
-        if not cleaned_statements:
-            errors.append("El método main no contiene sentencias ejecutables para generar código intermedio.")
-            return ValidationResult(is_valid=False, class_name=class_name, errors=errors)
+        scopes: Dict[str, Dict[str, SymbolEntry]] = {"Global": {}}
+        methods_info: Dict[str, dict] = {}
+        global_decls: List[Tuple[SymbolEntry, Optional[str], int]] = []
 
-        return ValidationResult(
+        pos = class_open + 1
+        main_block_info = None
+
+        while pos < class_close:
+            while pos < class_close and clean_code[pos].isspace():
+                pos += 1
+            if pos >= class_close:
+                break
+
+            line_num = clean_code[:pos].count("\n") + 1
+            rest = clean_code[pos:class_close]
+
+            m_main = main_pattern.match(rest)
+            if m_main:
+                brace_idx = pos + m_main.end() - 1
+                end_brace = self._find_matching_brace(clean_code, brace_idx)
+                arg_name = m_main.group(1) or m_main.group(2)
+                main_block_info = (brace_idx + 1, end_brace, arg_name, line_num)
+                pos = end_brace + 1
+                continue
+
+            m_method = re.match(
+                r"^(?:(?:public|private|protected)\s+)?(?:static\s+)?([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*\{",
+                rest,
+            )
+            if m_method:
+                ret_type, meth_name, params_str = m_method.groups()
+                if ret_type not in self.RETURN_TYPES:
+                    return ExtendedValidationResult(
+                        is_valid=False,
+                        class_name=class_name,
+                        errors=[f"Error semántico en línea {line_num}: tipo de retorno '{ret_type}' no válido."],
+                        error_line=line_num,
+                    )
+                if meth_name in scopes["Global"]:
+                    return ExtendedValidationResult(
+                        is_valid=False,
+                        class_name=class_name,
+                        errors=[f"Error semántico en línea {line_num}: identificador '{meth_name}' duplicado."],
+                        error_line=line_num,
+                    )
+
+                meth_entry = SymbolEntry(
+                    id_code=next_id(),
+                    lexeme=meth_name,
+                    category="Método",
+                    data_type=ret_type,
+                    scope="Global",
+                )
+                symbols.append(meth_entry)
+                scopes["Global"][meth_name] = meth_entry
+                scopes[meth_name] = {}
+
+                param_entries: List[SymbolEntry] = []
+                if params_str.strip():
+                    for p in params_str.split(","):
+                        pm = re.match(r"^\s*([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*$", p)
+                        if not pm or pm.group(1) not in self.VALID_TYPES:
+                            return ExtendedValidationResult(
+                                is_valid=False,
+                                class_name=class_name,
+                                errors=[f"Error sintáctico en línea {line_num}: parámetro inválido '{p.strip()}'."],
+                                error_line=line_num,
+                            )
+                        p_type, p_name = pm.groups()
+                        if p_name in scopes[meth_name]:
+                            return ExtendedValidationResult(
+                                is_valid=False,
+                                class_name=class_name,
+                                errors=[f"Error semántico en línea {line_num}: parámetro '{p_name}' duplicado."],
+                                error_line=line_num,
+                            )
+                        p_entry = SymbolEntry(
+                            id_code=next_id(),
+                            lexeme=p_name,
+                            category="Parámetro",
+                            data_type=p_type,
+                            scope=meth_name,
+                        )
+                        symbols.append(p_entry)
+                        scopes[meth_name][p_name] = p_entry
+                        param_entries.append(p_entry)
+
+                brace_idx = pos + m_method.end() - 1
+                end_brace = self._find_matching_brace(clean_code, brace_idx)
+                methods_info[meth_name] = {
+                    "entry": meth_entry,
+                    "params": param_entries,
+                    "body_start": brace_idx + 1,
+                    "body_end": end_brace,
+                }
+                pos = end_brace + 1
+                continue
+
+            semi_idx = clean_code.find(";", pos, class_close)
+            if semi_idx == -1:
+                snippet = rest.splitlines()[0].strip()
+                return ExtendedValidationResult(
+                    is_valid=False,
+                    class_name=class_name,
+                    errors=[f"Error sintáctico en línea {line_num}: falta ';' en '{snippet}'."],
+                    error_line=line_num,
+                )
+
+            stmt_raw = clean_code[pos:semi_idx].strip()
+            m_attr = re.match(
+                r"^(?:(?:public|private|protected)\s+)?(?:static\s+)?(?:final\s+)?([A-Za-z_]\w*)\s+([A-Za-z_]\w*)(?:\s*=\s*(.+))?$",
+                stmt_raw,
+                re.DOTALL,
+            )
+            if not m_attr:
+                return ExtendedValidationResult(
+                    is_valid=False,
+                    class_name=class_name,
+                    errors=[f"Error sintáctico en línea {line_num}: declaración de atributo inválida '{stmt_raw}'."],
+                    error_line=line_num,
+                )
+
+            var_type, var_name, expr = m_attr.groups()
+            if var_type not in self.VALID_TYPES:
+                return ExtendedValidationResult(
+                    is_valid=False,
+                    class_name=class_name,
+                    errors=[f"Error semántico en línea {line_num}: tipo de dato desconocido '{var_type}'."],
+                    error_line=line_num,
+                )
+            if var_name in scopes["Global"]:
+                return ExtendedValidationResult(
+                    is_valid=False,
+                    class_name=class_name,
+                    errors=[f"Error semántico en línea {line_num}: atributo '{var_name}' ya fue declarado."],
+                    error_line=line_num,
+                )
+
+            init_val = expr.strip() if expr is not None else self.DEFAULT_VALUES[var_type]
+            attr_entry = SymbolEntry(
+                id_code=next_id(),
+                lexeme=var_name,
+                category="Atributo Global",
+                data_type=var_type,
+                scope="Global",
+                initial_value=init_val,
+            )
+            symbols.append(attr_entry)
+            scopes["Global"][var_name] = attr_entry
+            global_decls.append((attr_entry, init_val, line_num))
+            pos = semi_idx + 1
+
+        instructions: List[IRInstruction] = []
+        cleaned_statements: List[str] = []
+        emitted_methods: Set[str] = set()
+
+        # 1. Atributos globales (se inicializan primero al instanciar la clase)
+        for attr_entry, init_expr, lnum in global_decls:
+            resolved_expr, err = self._resolve_expression(init_expr, "Global", scopes, class_name, main_class_id)
+            if err:
+                return ExtendedValidationResult(
+                    is_valid=False,
+                    class_name=class_name,
+                    errors=[f"Error en línea {lnum}: {err}"],
+                    error_line=lnum,
+                )
+            instructions.append(
+                IRInstruction(
+                    kind="ASSIGN",
+                    target_id=attr_entry.id_code,
+                    target_type=attr_entry.data_type,
+                    expr=resolved_expr,
+                    scope="Global",
+                )
+            )
+            cleaned_statements.append(f"{attr_entry.id_code} = {resolved_expr}")
+
+        # 2. Registrar parámetro args de main y procesar cuerpo de main (expande llamadas en orden real)
+        m_start, m_end, arg_name, main_line = main_block_info
+        scopes["main"] = {}
+        args_entry = SymbolEntry(
+            id_code=next_id(),
+            lexeme=arg_name,
+            category="Parámetro",
+            data_type="String[]",
+            scope="main",
+        )
+        symbols.append(args_entry)
+        scopes["main"][arg_name] = args_entry
+
+        err_res = self._parse_block_statements(
+            clean_code=clean_code,
+            start_idx=m_start,
+            end_idx=m_end,
+            scope="main",
+            scopes=scopes,
+            symbols=symbols,
+            next_id=next_id,
+            instructions=instructions,
+            cleaned_statements=cleaned_statements,
+            class_name=class_name,
+            main_class_id=main_class_id,
+            methods_info=methods_info,
+            method_entry=None,
+            emitted_methods=emitted_methods,
+        )
+        if err_res is not None:
+            return err_res
+
+        # 3. Validar/emitir métodos auxiliares que no hayan sido invocados desde main
+        for meth_name, minfo in methods_info.items():
+            if meth_name not in emitted_methods:
+                emitted_methods.add(meth_name)
+                err_res = self._parse_block_statements(
+                    clean_code=clean_code,
+                    start_idx=minfo["body_start"],
+                    end_idx=minfo["body_end"],
+                    scope=meth_name,
+                    scopes=scopes,
+                    symbols=symbols,
+                    next_id=next_id,
+                    instructions=instructions,
+                    cleaned_statements=cleaned_statements,
+                    class_name=class_name,
+                    main_class_id=main_class_id,
+                    methods_info=methods_info,
+                    method_entry=minfo["entry"],
+                    emitted_methods=emitted_methods,
+                )
+                if err_res is not None:
+                    return err_res
+
+        if len(instructions) == 0:
+            return ExtendedValidationResult(
+                is_valid=False,
+                class_name=class_name,
+                errors=[f"Error en línea {main_line}: el método main no contiene sentencias ejecutables."],
+                error_line=main_line,
+            )
+
+        return ExtendedValidationResult(
             is_valid=True,
             class_name=class_name,
             errors=[],
-            cleaned_statements=cleaned_statements
+            cleaned_statements=cleaned_statements,
+            symbols=symbols,
+            instructions=instructions,
+            main_class_id=main_class_id,
         )
 
-    def _strip_comments(self, code: str) -> str:
-        code = re.sub(r"/\*[\s\S]*?\*/", "", code)
+    def _parse_block_statements(
+        self,
+        clean_code: str,
+        start_idx: int,
+        end_idx: int,
+        scope: str,
+        scopes: Dict[str, Dict[str, SymbolEntry]],
+        symbols: List[SymbolEntry],
+        next_id,
+        instructions: List[IRInstruction],
+        cleaned_statements: List[str],
+        class_name: str,
+        main_class_id: str,
+        methods_info: Dict[str, dict],
+        method_entry: Optional[SymbolEntry],
+        emitted_methods: Set[str],
+    ) -> Optional[ExtendedValidationResult]:
+        block_text = clean_code[start_idx:end_idx]
+        lines = block_text.splitlines()
+        base_line = clean_code[:start_idx].count("\n") + 1
+
+        for offset, raw_line in enumerate(lines):
+            stmt_line = raw_line.strip()
+            line_num = base_line + offset
+            if not stmt_line:
+                continue
+
+            if not stmt_line.endswith(";"):
+                return ExtendedValidationResult(
+                    is_valid=False,
+                    class_name=class_name,
+                    errors=[f"Error sintáctico en línea {line_num}: falta ';' al final de '{stmt_line}'."],
+                    error_line=line_num,
+                )
+
+            stmt = stmt_line[:-1].strip()
+            if not stmt:
+                continue
+
+            # 1. System.out.println(...) / System.out.print(...)
+            m_sout = re.match(r"^System\.out\.print(?:ln)?\s*\((.+)\)$", stmt)
+            if m_sout:
+                inner = m_sout.group(1).strip()
+                m_obj_call = re.match(
+                    rf"^new\s+{re.escape(class_name)}\s*\(\s*\)\s*\.\s*([A-Za-z_]\w*)\s*\((.*)\)$",
+                    inner,
+                )
+                if m_obj_call:
+                    called_meth, raw_args = m_obj_call.groups()
+                    if called_meth not in methods_info:
+                        return ExtendedValidationResult(
+                            is_valid=False,
+                            class_name=class_name,
+                            errors=[f"Error semántico en línea {line_num}: método '{called_meth}' no existe en '{class_name}'."],
+                            error_line=line_num,
+                        )
+                    err = self._invoke_method(
+                        called_meth, raw_args, clean_code, scope, scopes, symbols, next_id,
+                        methods_info, instructions, cleaned_statements, class_name, main_class_id,
+                        line_num, emitted_methods
+                    )
+                    if err:
+                        return err
+                    m_sym = methods_info[called_meth]["entry"]
+                    instructions.append(
+                        IRInstruction(
+                            kind="CALL_SOUT",
+                            target_id=main_class_id,
+                            target_type=m_sym.data_type,
+                            expr=m_sym.id_code,
+                            scope=scope,
+                        )
+                    )
+                    cleaned_statements.append(f"SOUT {main_class_id}.{m_sym.id_code}")
+                    continue
+
+                m_obj_attr = re.match(
+                    rf"^new\s+{re.escape(class_name)}\s*\(\s*\)\s*\.\s*([A-Za-z_]\w*)$",
+                    inner,
+                )
+                if m_obj_attr:
+                    attr_name = m_obj_attr.group(1)
+                    if attr_name not in scopes["Global"]:
+                        return ExtendedValidationResult(
+                            is_valid=False,
+                            class_name=class_name,
+                            errors=[f"Error semántico en línea {line_num}: atributo '{attr_name}' no declarado."],
+                            error_line=line_num,
+                        )
+                    a_sym = scopes["Global"][attr_name]
+                    instructions.append(
+                        IRInstruction(
+                            kind="CALL_SOUT",
+                            target_id=main_class_id,
+                            target_type=a_sym.data_type,
+                            expr=a_sym.id_code,
+                            scope=scope,
+                        )
+                    )
+                    cleaned_statements.append(f"SOUT {main_class_id}.{a_sym.id_code}")
+                    continue
+
+                resolved_expr, err = self._resolve_expression(inner, scope, scopes, class_name, main_class_id)
+                if err:
+                    return ExtendedValidationResult(
+                        is_valid=False,
+                        class_name=class_name,
+                        errors=[f"Error en línea {line_num}: {err}"],
+                        error_line=line_num,
+                    )
+                target = method_entry.id_code if method_entry else "PMAIN"
+                instructions.append(
+                    IRInstruction(
+                        kind="SOUT",
+                        target_id=target,
+                        target_type="void",
+                        expr=resolved_expr,
+                        scope=scope,
+                        method_owner_id=method_entry.id_code if method_entry else "",
+                    )
+                )
+                cleaned_statements.append(f"PRINT {resolved_expr}")
+                continue
+
+            # 2. Llamada directa a método: new Clase().metodo(args...);
+            m_direct_call = re.match(
+                rf"^new\s+{re.escape(class_name)}\s*\(\s*\)\s*\.\s*([A-Za-z_]\w*)\s*\((.*)\)$",
+                stmt,
+            )
+            if m_direct_call:
+                called_meth, raw_args = m_direct_call.groups()
+                if called_meth not in methods_info:
+                    return ExtendedValidationResult(
+                        is_valid=False,
+                        class_name=class_name,
+                        errors=[f"Error semántico en línea {line_num}: método '{called_meth}' no existe."],
+                        error_line=line_num,
+                    )
+                err = self._invoke_method(
+                    called_meth, raw_args, clean_code, scope, scopes, symbols, next_id,
+                    methods_info, instructions, cleaned_statements, class_name, main_class_id,
+                    line_num, emitted_methods
+                )
+                if err:
+                    return err
+                m_sym = methods_info[called_meth]["entry"]
+                instructions.append(
+                    IRInstruction(
+                        kind="CALL",
+                        target_id=main_class_id,
+                        target_type=m_sym.data_type,
+                        expr=m_sym.id_code,
+                        scope=scope,
+                    )
+                )
+                cleaned_statements.append(f"{main_class_id}.{m_sym.id_code}")
+                continue
+
+            # 3. Sentencia return expr;
+            m_ret = re.match(r"^return\s+(.+)$", stmt)
+            if m_ret:
+                if method_entry is None:
+                    return ExtendedValidationResult(
+                        is_valid=False,
+                        class_name=class_name,
+                        errors=[f"Error semántico en línea {line_num}: 'return' con valor no permitido en main."],
+                        error_line=line_num,
+                    )
+                resolved_expr, err = self._resolve_expression(m_ret.group(1), scope, scopes, class_name, main_class_id)
+                if err:
+                    return ExtendedValidationResult(
+                        is_valid=False,
+                        class_name=class_name,
+                        errors=[f"Error en línea {line_num}: {err}"],
+                        error_line=line_num,
+                    )
+                instructions.append(
+                    IRInstruction(
+                        kind="RTN",
+                        target_id=method_entry.id_code,
+                        target_type=method_entry.data_type,
+                        expr=resolved_expr,
+                        scope=scope,
+                        method_owner_id=method_entry.id_code,
+                    )
+                )
+                cleaned_statements.append(f"RETURN {resolved_expr}")
+                continue
+
+            # 4. Declaración local: tipo nombre [= expr];
+            m_decl = re.match(r"^(?:final\s+)?([A-Za-z_]\w*)\s+([A-Za-z_]\w*)(?:\s*=\s*(.+))?$", stmt)
+            if m_decl:
+                var_type, var_name, expr = m_decl.groups()
+                if var_type not in self.VALID_TYPES:
+                    return ExtendedValidationResult(
+                        is_valid=False,
+                        class_name=class_name,
+                        errors=[f"Error semántico en línea {line_num}: tipo de dato no válido '{var_type}'."],
+                        error_line=line_num,
+                    )
+                if var_name in scopes[scope]:
+                    return ExtendedValidationResult(
+                        is_valid=False,
+                        class_name=class_name,
+                        errors=[f"Error semántico en línea {line_num}: variable local '{var_name}' duplicada en '{scope}'."],
+                        error_line=line_num,
+                    )
+                init_val = expr.strip() if expr is not None else self.DEFAULT_VALUES[var_type]
+                local_entry = SymbolEntry(
+                    id_code=next_id(),
+                    lexeme=var_name,
+                    category="Variable Local",
+                    data_type=var_type,
+                    scope=scope,
+                    initial_value=init_val,
+                )
+                symbols.append(local_entry)
+                scopes[scope][var_name] = local_entry
+
+                resolved_expr, err = self._resolve_expression(init_val, scope, scopes, class_name, main_class_id)
+                if err:
+                    return ExtendedValidationResult(
+                        is_valid=False,
+                        class_name=class_name,
+                        errors=[f"Error en línea {line_num}: {err}"],
+                        error_line=line_num,
+                    )
+                instructions.append(
+                    IRInstruction(
+                        kind="ASSIGN",
+                        target_id=local_entry.id_code,
+                        target_type=local_entry.data_type,
+                        expr=resolved_expr,
+                        scope=scope,
+                    )
+                )
+                cleaned_statements.append(f"{local_entry.id_code} = {resolved_expr}")
+                continue
+
+            # 5. Asignación a variable existente: nombre = expr;
+            m_assign = re.match(r"^([A-Za-z_]\w*)\s*=\s*(.+)$", stmt)
+            if m_assign:
+                var_name, expr = m_assign.groups()
+                sym = self._lookup_symbol(var_name, scope, scopes)
+                if sym is None:
+                    return ExtendedValidationResult(
+                        is_valid=False,
+                        class_name=class_name,
+                        errors=[f"Error semántico en línea {line_num}: variable '{var_name}' no declarada antes de su uso."],
+                        error_line=line_num,
+                    )
+                resolved_expr, err = self._resolve_expression(expr, scope, scopes, class_name, main_class_id)
+                if err:
+                    return ExtendedValidationResult(
+                        is_valid=False,
+                        class_name=class_name,
+                        errors=[f"Error en línea {line_num}: {err}"],
+                        error_line=line_num,
+                    )
+                instructions.append(
+                    IRInstruction(
+                        kind="ASSIGN",
+                        target_id=sym.id_code,
+                        target_type=sym.data_type,
+                        expr=resolved_expr,
+                        scope=scope,
+                    )
+                )
+                cleaned_statements.append(f"{sym.id_code} = {resolved_expr}")
+                continue
+
+            return ExtendedValidationResult(
+                is_valid=False,
+                class_name=class_name,
+                errors=[f"Error sintáctico en línea {line_num}: instrucción no válida '{stmt_line}'."],
+                error_line=line_num,
+            )
+
+        return None
+
+    def _invoke_method(
+        self,
+        called_meth: str,
+        raw_args: str,
+        clean_code: str,
+        caller_scope: str,
+        scopes: Dict[str, Dict[str, SymbolEntry]],
+        symbols: List[SymbolEntry],
+        next_id,
+        methods_info: Dict[str, dict],
+        instructions: List[IRInstruction],
+        cleaned_statements: List[str],
+        class_name: str,
+        main_class_id: str,
+        line_num: int,
+        emitted_methods: Set[str],
+    ) -> Optional[ExtendedValidationResult]:
+        minfo = methods_info[called_meth]
+        params = minfo["params"]
+        arg_list = [a.strip() for a in raw_args.split(",")] if raw_args.strip() else []
+        if len(arg_list) != len(params):
+            return ExtendedValidationResult(
+                is_valid=False,
+                class_name=class_name,
+                errors=[
+                    f"Error semántico en línea {line_num}: '{called_meth}' espera {len(params)} argumento(s), recibió {len(arg_list)}."
+                ],
+                error_line=line_num,
+            )
+        # 1. Asignar argumentos a parámetros (ej. ID5 = '@')
+        for p_sym, arg_expr in zip(params, arg_list):
+            resolved_arg, err = self._resolve_expression(arg_expr, caller_scope, scopes, class_name, main_class_id)
+            if err:
+                return ExtendedValidationResult(
+                    is_valid=False,
+                    class_name=class_name,
+                    errors=[f"Error en línea {line_num}: {err}"],
+                    error_line=line_num,
+                )
+            instructions.append(
+                IRInstruction(
+                    kind="ASSIGN",
+                    target_id=p_sym.id_code,
+                    target_type=p_sym.data_type,
+                    expr=resolved_arg,
+                    scope=called_meth,
+                )
+            )
+            cleaned_statements.append(f"{p_sym.id_code} = {resolved_arg}")
+
+        # 2. Ejecutar/emitir el cuerpo del método llamado ya con los parámetros inicializados
+        if called_meth not in emitted_methods:
+            emitted_methods.add(called_meth)
+            return self._parse_block_statements(
+                clean_code=clean_code,
+                start_idx=minfo["body_start"],
+                end_idx=minfo["body_end"],
+                scope=called_meth,
+                scopes=scopes,
+                symbols=symbols,
+                next_id=next_id,
+                instructions=instructions,
+                cleaned_statements=cleaned_statements,
+                class_name=class_name,
+                main_class_id=main_class_id,
+                methods_info=methods_info,
+                method_entry=minfo["entry"],
+                emitted_methods=emitted_methods,
+            )
+        return None
+
+    def _lookup_symbol(self, name: str, scope: str, scopes: Dict[str, Dict[str, SymbolEntry]]) -> Optional[SymbolEntry]:
+        if scope in scopes and name in scopes[scope]:
+            return scopes[scope][name]
+        if name in scopes["Global"]:
+            return scopes["Global"][name]
+        return None
+
+    def _resolve_expression(
+        self,
+        expr: str,
+        scope: str,
+        scopes: Dict[str, Dict[str, SymbolEntry]],
+        class_name: str,
+        main_class_id: str,
+    ) -> Tuple[str, Optional[str]]:
+        expr = expr.strip()
+        if not expr:
+            return "", "expresión vacía."
+
+        no_strings = re.sub(r'"[^"]*"|\'[^\']*\'', "STR", expr)
+        if re.match(r"^[*/%+]", no_strings) or re.search(r"[+\-*/%=]$", no_strings):
+            return "", f"expresión mal formada '{expr}'."
+        if re.search(r"[*/%]\s*[+\-*/%]", no_strings) or re.search(r"[+\-]\s*[*/%]", no_strings):
+            return "", f"operadores consecutivos inválidos en '{expr}'."
+
+        token_pattern = re.compile(r'"[^"]*"|\'[^\']*\'|\b[A-Za-z_]\w*\b')
+        error_msg: Optional[str] = None
+
+        def replacer(match: re.Match) -> str:
+            nonlocal error_msg
+            tok = match.group(0)
+            if tok.startswith('"') or tok.startswith("'"):
+                return tok
+            if tok in self.RESERVED or re.match(r"^ID\d+$", tok):
+                return tok
+            if tok == class_name:
+                return main_class_id
+            sym = self._lookup_symbol(tok, scope, scopes)
+            if sym is None:
+                error_msg = f"identificador '{tok}' no declarado en el ámbito '{scope}'."
+                return tok
+            return sym.id_code
+
+        resolved = token_pattern.sub(replacer, expr)
+        if error_msg:
+            return "", error_msg
+        return resolved, None
+
+    def _strip_comments_preserve_lines(self, code: str) -> str:
+        def block_repl(m: re.Match) -> str:
+            return "\n" * m.group(0).count("\n")
+
+        code = re.sub(r"/\*[\s\S]*?\*/", block_repl, code)
         code = re.sub(r"//.*", "", code)
         return code
 
-    def _extract_block_content(self, code: str, open_brace_index: int):
+    def _find_matching_brace(self, code: str, open_idx: int) -> Optional[int]:
         depth = 0
-        for i in range(open_brace_index, len(code)):
+        for i in range(open_idx, len(code)):
             if code[i] == "{":
                 depth += 1
             elif code[i] == "}":
                 depth -= 1
                 if depth == 0:
-                    return code[open_brace_index + 1:i]
+                    return i
         return None
 
-    def _validate_statements(self, body: str, errors: list) -> list[str]:
-        lines = [line.strip() for line in body.splitlines() if line.strip()]
-        cleaned = []
-        declared_vars = set()
+    def _find_illegal_chars(self, code: str) -> Optional[int]:
+        cleaned = re.sub(r'"[^"\n]*"|\'[^\'\n]*\'', "", code)
+        for line_no, line in enumerate(cleaned.splitlines(), start=1):
+            if re.search(r"[@$#¿?¡]", line):
+                return line_no
+        return None
 
-        for idx, line in enumerate(lines, start=1):
-            if not line.endswith(";"):
-                errors.append(f"Línea {idx} dentro de main ('{line}'): falta punto y coma ';' al final.")
-                continue
+    def _find_unbalanced_line(self, code: str, open_ch: str, close_ch: str) -> int:
+        depth = 0
+        last_open_line = 1
+        for line_no, line in enumerate(code.splitlines(), start=1):
+            for ch in line:
+                if ch == open_ch:
+                    depth += 1
+                    last_open_line = line_no
+                elif ch == close_ch:
+                    depth -= 1
+                    if depth < 0:
+                        return line_no
+        return last_open_line
 
-            stmt = line[:-1].strip()
-            if not stmt:
-                continue
-
-            # Detectar System.out.println(...) o System.out.print(...) para rastrear uso real de variables (CM)
-            print_match = re.match(r"^System\.out\.print(?:ln)?\s*\((.+)\)$", stmt)
-            if print_match:
-                expr = print_match.group(1).strip()
-                if not self._is_valid_expression(expr):
-                    errors.append(f"Expresión inválida en impresión '{expr}' en '{line}'.")
-                    continue
-                cleaned.append(f"PRINT {expr}")
-                continue
-
-            # Caso A: Declaración con o sin inicialización -> ej: int a = 5 + 3; o int x;
-            decl_match = re.match(r"^([A-Za-z_]\w*)\s+([A-Za-z_]\w*)(?:\s*=\s*(.+))?$", stmt)
-            if decl_match:
-                var_type, var_name, expr = decl_match.groups()
-                if var_type not in self.VALID_TYPES:
-                    errors.append(f"Tipo de dato no reconocido '{var_type}' en '{line}'.")
-                    continue
-                if var_name in declared_vars:
-                    errors.append(f"Variable '{var_name}' declarada duplicada en '{line}'.")
-                    continue
-                declared_vars.add(var_name)
-                if expr is not None:
-                    if not self._is_valid_expression(expr):
-                        errors.append(f"Expresión inválida '{expr}' en '{line}'.")
-                        continue
-                    cleaned.append(f"{var_name} = {expr.strip()}")
-                continue
-
-            # Caso B: Asignación simple -> ej: area = base * altura + 2;
-            assign_match = re.match(r"^([A-Za-z_]\w*)\s*=\s*(.+)$", stmt)
-            if assign_match:
-                var_name, expr = assign_match.groups()
-                if var_name not in declared_vars:
-                    errors.append(f"Variable '{var_name}' no declarada antes de su uso en '{line}'.")
-                    continue
-                if not self._is_valid_expression(expr):
-                    errors.append(f"Expresión inválida '{expr}' en '{line}'.")
-                    continue
-                cleaned.append(f"{var_name} = {expr.strip()}")
-                continue
-
-            errors.append(f"Sentencia no válida o no depurada en '{line}'.")
-
-        return cleaned
-
-    def _is_valid_expression(self, expr: str) -> bool:
-        expr = expr.strip()
-        if not expr:
-            return False
-        if re.match(r"^[*/%+]", expr) or re.search(r"[+\-*/%=]$", expr):
-            return False
-        if re.search(r"[+\-*/%]\s*[+\-*/%]", expr):
-            return False
-        if not re.match(r"^[A-Za-z0-9_.\s+\-*/%()\"']+$", expr):
-            return False
-        return True
+    def _line_of_snippet(self, code: str, snippet: str) -> int:
+        idx = code.find(snippet)
+        return 1 if idx == -1 else code[:idx].count("\n") + 1
