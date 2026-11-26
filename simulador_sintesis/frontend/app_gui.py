@@ -421,3 +421,15 @@ class SynthesisSimulatorApp(ctk.CTk):
                 for row in result.optimization_rows
             ]
             self._sync_treeview_inplace(self.opt_tree, opt_values)
+            # Actualizar encabezados de la tabla de optimización según el modo activo
+        if mode == "TRIPLOS":
+            self.opt_tree.heading("#1", text="Triplo original")
+            self.opt_tree.heading("#3", text="Triplo afectado")
+            self.opt_tree.heading("#4", text="Triplo modificado")
+        else:
+            self.opt_tree.heading("#1", text="Cuádruplo original")
+            self.opt_tree.heading("#3", text="Cuádruplo afectado")
+            self.opt_tree.heading("#4", text="Cuádruplo modificado")
+
+        # Evitar que se recorte el texto "Cuádruplo afectado" en la 3ra columna
+        self.opt_tree.column("#3", width=155)
