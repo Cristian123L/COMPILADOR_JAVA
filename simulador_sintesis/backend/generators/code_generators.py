@@ -27,6 +27,8 @@ class TypedVal:
             return txt
         if self.vtype == "int":
             return str(int(self.raw_val))
+        if self.vtype == "boolean":
+            return "true" if bool(self.raw_val) else "false"
         if self.vtype == "char":
             if isinstance(self.raw_val, int):
                 return f"'{chr(self.raw_val)}'"
@@ -41,7 +43,7 @@ class TypedVal:
 class ExecStepNode:
     """Nodo ejecutable dentro del Árbol Abstracto-Semántico unificado."""
     uid: int
-    kind: str                          # OP, ASSIGN, RTN, SOUT, CALL, CALL_SOUT
+    kind: str                          # OP, ASSIGN, NEW_OBJ, RTN, SOUT, CALL, CALL_SOUT
     ope: str
     target_id: str = ""
     target_type: str = ""
@@ -82,6 +84,21 @@ class IntermediateCodeGenerator:
                         return tok, def_node
                 return tok, None
 
+            if expr_node.is_unary:
+                r_tok, r_sub = convert_expr(expr_node.right)
+                kids = [r_sub] if r_sub is not None else []
+                op_node = ExecStepNode(
+                    uid=next_uid(),
+                    kind="OP",
+                    ope=expr_node.value,
+                    left_tok="-",
+                    right_tok=r_tok,
+                    left_node=None,
+                    right_node=r_sub,
+                    children=kids,
+                )
+                return "", op_node
+
             l_tok, l_sub = convert_expr(expr_node.left)
             r_tok, r_sub = convert_expr(expr_node.right)
             kids: List[ExecStepNode] = []
@@ -103,7 +120,20 @@ class IntermediateCodeGenerator:
             return "", op_node
 
         for inst in instructions:
-            if inst.kind in ("ASSIGN", "RTN", "SOUT"):
+            if inst.kind == "NEW_OBJ":
+                node = ExecStepNode(
+                    uid=next_uid(),
+                    kind="NEW_OBJ",
+                    ope="=",
+                    target_id=inst.target_id,
+                    target_type=inst.target_type,
+                    left_tok=inst.target_id,
+                    right_tok=inst.expr,
+                )
+                inst_nodes.append(node)
+                latest_def[inst.target_id] = node
+
+            elif inst.kind in ("ASSIGN", "RTN", "SOUT"):
                 ast = ExpressionParser.build_ast(inst.expr)
                 val_tok, sub_node = convert_expr(ast)
                 kids = [sub_node] if sub_node is not None else []
@@ -261,7 +291,7 @@ class IntermediateCodeGenerator:
                 node_ref[node.uid] = f"[{idx}]"
                 idx += 1
 
-            elif node.kind in ("ASSIGN", "RTN", "SOUT"):
+            elif node.kind in ("ASSIGN", "NEW_OBJ", "RTN", "SOUT"):
                 v2 = node_ref[node.right_node.uid] if node.right_node else last_id_ref.get(node.right_tok, node.right_tok)
                 triplos.append(Triplo(indice=idx, val1=node.target_id, ope=node.ope, val2=v2))
                 ref = f"[{idx}]"
@@ -312,6 +342,18 @@ class IntermediateCodeGenerator:
                 )
                 node_ref[node.uid] = f"[{idx}]"
                 node_val[node.uid] = res_tv
+                idx += 1
+
+            elif node.kind == "NEW_OBJ":
+                tv_obj = TypedVal(node.target_type, "object")
+                env[node.target_id] = tv_obj
+                cuadruplos.append(
+                    Cuadruplo(indice=idx, val1=node.target_id, ope="=", val2=node.right_tok, res=node.target_type)
+                )
+                ref = f"[{idx}]"
+                node_ref[node.uid] = ref
+                node_val[node.uid] = tv_obj
+                last_id_ref[node.target_id] = ref
                 idx += 1
 
             elif node.kind == "ASSIGN":
@@ -384,7 +426,6 @@ class IntermediateCodeGenerator:
         instructions: List[IRInstruction],
         main_class_id: str = "ID1",
     ) -> Tuple[List[TresDirecciones], str]:
-        
         plan = self._build_bottom_up_plan(instructions, defer_pending_for_3dir=True)
         salida: List[TresDirecciones] = []
         in_use: Set[int] = set()
@@ -413,7 +454,7 @@ class IntermediateCodeGenerator:
                 node_reg[node.uid] = dest_reg
                 last_holder = f"T{dest_reg}"
 
-            elif node.kind == "ASSIGN":
+            elif node.kind in ("ASSIGN", "NEW_OBJ"):
                 v2 = node_holder[node.right_node.uid] if node.right_node else node.right_tok
                 r2 = node_reg.get(node.right_node.uid) if node.right_node else None
 
@@ -497,6 +538,10 @@ class IntermediateCodeGenerator:
     def _literal_or_id_to_typed(self, tok: str, env: Dict[str, TypedVal]) -> TypedVal:
         if tok in env:
             return env[tok]
+        if tok == "true":
+            return TypedVal(True, "boolean")
+        if tok == "false":
+            return TypedVal(False, "boolean")
         if tok.startswith('"') and tok.endswith('"'):
             return TypedVal(tok[1:-1], "String")
         if tok.startswith("'") and tok.endswith("'"):
@@ -523,6 +568,8 @@ class IntermediateCodeGenerator:
         if target_type == "int":
             val = tv.raw_val if isinstance(tv.raw_val, (int, float)) else 0
             return TypedVal(int(val), "int")
+        if target_type == "boolean":
+            return TypedVal(bool(tv.raw_val), "boolean")
         if target_type == "char":
             val = int(tv.raw_val) if isinstance(tv.raw_val, (int, float)) else 0
             return TypedVal(val, "char")
@@ -531,6 +578,31 @@ class IntermediateCodeGenerator:
         return tv
 
     def _eval_binary_typed(self, v1: TypedVal, ope: str, v2: TypedVal) -> TypedVal:
+        if ope == "!":
+            return TypedVal(not bool(v2.raw_val), "boolean")
+
+        if ope in (">=", "<=", "==", "!=", "<", ">"):
+            if ope in ("==", "!=") and (
+                v1.vtype in ("boolean", "String") or v2.vtype in ("boolean", "String")
+            ):
+                res = (v1.raw_val == v2.raw_val) if ope == "==" else (v1.raw_val != v2.raw_val)
+                return TypedVal(res, "boolean")
+            a = float(v1.raw_val) if isinstance(v1.raw_val, (int, float)) else 0.0
+            b = float(v2.raw_val) if isinstance(v2.raw_val, (int, float)) else 0.0
+            if ope == ">=":
+                res = a >= b
+            elif ope == "<=":
+                res = a <= b
+            elif ope == "==":
+                res = a == b
+            elif ope == "!=":
+                res = a != b
+            elif ope == "<":
+                res = a < b
+            else:
+                res = a > b
+            return TypedVal(res, "boolean")
+
         if ope == ".":
             if str(v2.raw_val) == "length()" or v2.vtype == "int":
                 s_len = len(str(v1.raw_val))

@@ -10,7 +10,7 @@ class IRInstruction:
     """Instrucción intermedia normalizada con IDs resueltos por ámbito."""
     kind: str                  # ASSIGN, NEW_OBJ, SOUT, RTN, CALL, CALL_SOUT
     target_id: str             # Ej. ID2, PMAIN, ID4
-    target_type: str           # int, float, double, char, String, boolean, void, o nombre de clase
+    target_type: str           # int, float, double, char, String, boolean, void, o clase
     expr: str                  # Expresión con nombres originales reescritos a IDx
     scope: str                 # Global o nombre del método
     method_owner_id: str = ""  # ID del método si pertenece a un método auxiliar
@@ -26,12 +26,13 @@ class ExtendedValidationResult(ValidationResult):
 
 class JavaValidator:
     """
-    Valida sintaxis/semántica básica de Java (GLC Unidad 1/2) y construye la
-    Tabla de Símbolos (ID1, ID2...) diferenciando ámbito Global vs. Local.
+    Valida sintaxis y compatibilidad de tipos en Java para la Etapa de Síntesis,
+    construyendo la Tabla de Símbolos (ID1, ID2...) por ámbito Global y Local.
     """
 
     VALID_TYPES = {"int", "double", "float", "long", "short", "byte", "boolean", "char", "String"}
     RETURN_TYPES = VALID_TYPES | {"void"}
+    NUMERIC_TYPES = {"double", "float", "long", "int", "short", "byte", "char"}
     RESERVED = VALID_TYPES | {
         "public", "private", "protected", "static", "final", "class", "void",
         "new", "return", "if", "else", "while", "for", "System", "out",
@@ -59,6 +60,14 @@ class JavaValidator:
             )
 
         clean_code = self._strip_comments_preserve_lines(source_code)
+
+        unclosed_line = self._find_unclosed_quotes(clean_code)
+        if unclosed_line is not None:
+            return ExtendedValidationResult(
+                is_valid=False,
+                errors=[f"Error léxico en línea {unclosed_line}: literal de cadena o carácter sin cerrar."],
+                error_line=unclosed_line,
+            )
 
         illegal_line = self._find_illegal_chars(clean_code)
         if illegal_line is not None:
@@ -101,15 +110,15 @@ class JavaValidator:
 
         before_class = clean_code[:class_match.start()].strip()
         for raw_l in before_class.splitlines():
-            s = raw_l.strip()
+            s = raw_l.rstrip(";").strip()
             if not s:
                 continue
-            if not (re.match(r"^package\s+[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\s*;$", s) or
-                    re.match(r"^import\s+[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*(?:\.\*)?\s*;$", s)):
-                err_l = self._line_of_snippet(clean_code, s)
+            if not (re.match(r"^package\s+[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$", s) or
+                    re.match(r"^import\s+[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*(?:\.\*)?$", s)):
+                err_l = self._line_of_snippet(clean_code, raw_l.strip())
                 return ExtendedValidationResult(
                     is_valid=False,
-                    errors=[f"Error sintáctico en línea {err_l}: sentencia inválida fuera de la clase ('{s}')."],
+                    errors=[f"Error sintáctico en línea {err_l}: sentencia inválida fuera de la clase ('{raw_l.strip()}')."],
                     error_line=err_l,
                 )
 
@@ -126,6 +135,7 @@ class JavaValidator:
             )
 
         symbols: List[SymbolEntry] = []
+        sym_by_id: Dict[str, SymbolEntry] = {}
         id_counter = 1
 
         def next_id() -> str:
@@ -134,8 +144,13 @@ class JavaValidator:
             id_counter += 1
             return val
 
+        def register_symbol(entry: SymbolEntry) -> SymbolEntry:
+            symbols.append(entry)
+            sym_by_id[entry.id_code] = entry
+            return entry
+
         main_class_id = next_id()
-        symbols.append(
+        register_symbol(
             SymbolEntry(
                 id_code=main_class_id,
                 lexeme=class_name,
@@ -147,13 +162,13 @@ class JavaValidator:
 
         scopes: Dict[str, Dict[str, SymbolEntry]] = {"Global": {}}
         methods_info: Dict[str, dict] = {}
-        global_decls: List[Tuple[SymbolEntry, Optional[str], int]] = []
+        global_decls: List[Tuple[SymbolEntry, str, int]] = []
 
         pos = class_open + 1
         main_block_info = None
 
         while pos < class_close:
-            while pos < class_close and clean_code[pos].isspace():
+            while pos < class_close and (clean_code[pos].isspace() or clean_code[pos] == ";"):
                 pos += 1
             if pos >= class_close:
                 break
@@ -191,14 +206,15 @@ class JavaValidator:
                         error_line=line_num,
                     )
 
-                meth_entry = SymbolEntry(
-                    id_code=next_id(),
-                    lexeme=meth_name,
-                    category="Método",
-                    data_type=ret_type,
-                    scope="Global",
+                meth_entry = register_symbol(
+                    SymbolEntry(
+                        id_code=next_id(),
+                        lexeme=meth_name,
+                        category="Método",
+                        data_type=ret_type,
+                        scope="Global",
+                    )
                 )
-                symbols.append(meth_entry)
                 scopes["Global"][meth_name] = meth_entry
                 scopes[meth_name] = {}
 
@@ -221,14 +237,15 @@ class JavaValidator:
                                 errors=[f"Error semántico en línea {line_num}: parámetro '{p_name}' duplicado."],
                                 error_line=line_num,
                             )
-                        p_entry = SymbolEntry(
-                            id_code=next_id(),
-                            lexeme=p_name,
-                            category="Parámetro",
-                            data_type=p_type,
-                            scope=meth_name,
+                        p_entry = register_symbol(
+                            SymbolEntry(
+                                id_code=next_id(),
+                                lexeme=p_name,
+                                category="Parámetro",
+                                data_type=p_type,
+                                scope=meth_name,
+                            )
                         )
-                        symbols.append(p_entry)
                         scopes[meth_name][p_name] = p_entry
                         param_entries.append(p_entry)
 
@@ -284,15 +301,16 @@ class JavaValidator:
                 )
 
             init_val = expr.strip() if expr is not None else self.DEFAULT_VALUES[var_type]
-            attr_entry = SymbolEntry(
-                id_code=next_id(),
-                lexeme=var_name,
-                category="Atributo Global",
-                data_type=var_type,
-                scope="Global",
-                initial_value=init_val,
+            attr_entry = register_symbol(
+                SymbolEntry(
+                    id_code=next_id(),
+                    lexeme=var_name,
+                    category="Atributo Global",
+                    data_type=var_type,
+                    scope="Global",
+                    initial_value=init_val,
+                )
             )
-            symbols.append(attr_entry)
             scopes["Global"][var_name] = attr_entry
             global_decls.append((attr_entry, init_val, line_num))
             pos = semi_idx + 1
@@ -310,6 +328,14 @@ class JavaValidator:
                     errors=[f"Error en línea {lnum}: {err}"],
                     error_line=lnum,
                 )
+            type_err = self._check_assignment_types(attr_entry.data_type, resolved_expr, sym_by_id)
+            if type_err:
+                return ExtendedValidationResult(
+                    is_valid=False,
+                    class_name=class_name,
+                    errors=[f"Error semántico en línea {lnum}: {type_err}"],
+                    error_line=lnum,
+                )
             instructions.append(
                 IRInstruction(
                     kind="ASSIGN",
@@ -323,14 +349,15 @@ class JavaValidator:
 
         m_start, m_end, arg_name, main_line = main_block_info
         scopes["main"] = {}
-        args_entry = SymbolEntry(
-            id_code=next_id(),
-            lexeme=arg_name,
-            category="Parámetro",
-            data_type="String[]",
-            scope="main",
+        args_entry = register_symbol(
+            SymbolEntry(
+                id_code=next_id(),
+                lexeme=arg_name,
+                category="Parámetro",
+                data_type="String[]",
+                scope="main",
+            )
         )
-        symbols.append(args_entry)
         scopes["main"][arg_name] = args_entry
 
         err_res = self._parse_block_statements(
@@ -339,7 +366,8 @@ class JavaValidator:
             end_idx=m_end,
             scope="main",
             scopes=scopes,
-            symbols=symbols,
+            register_symbol=register_symbol,
+            sym_by_id=sym_by_id,
             next_id=next_id,
             instructions=instructions,
             cleaned_statements=cleaned_statements,
@@ -361,7 +389,8 @@ class JavaValidator:
                     end_idx=minfo["body_end"],
                     scope=meth_name,
                     scopes=scopes,
-                    symbols=symbols,
+                    register_symbol=register_symbol,
+                    sym_by_id=sym_by_id,
                     next_id=next_id,
                     instructions=instructions,
                     cleaned_statements=cleaned_statements,
@@ -399,7 +428,8 @@ class JavaValidator:
         end_idx: int,
         scope: str,
         scopes: Dict[str, Dict[str, SymbolEntry]],
-        symbols: List[SymbolEntry],
+        register_symbol,
+        sym_by_id: Dict[str, SymbolEntry],
         next_id,
         instructions: List[IRInstruction],
         cleaned_statements: List[str],
@@ -416,7 +446,7 @@ class JavaValidator:
         for offset, raw_line in enumerate(lines):
             stmt_line = raw_line.strip()
             line_num = base_line + offset
-            if not stmt_line:
+            if not stmt_line or set(stmt_line) == {";"}:
                 continue
 
             if not stmt_line.endswith(";"):
@@ -427,7 +457,7 @@ class JavaValidator:
                     error_line=line_num,
                 )
 
-            stmt = stmt_line[:-1].strip()
+            stmt = stmt_line.rstrip(";").strip()
             if not stmt:
                 continue
 
@@ -449,8 +479,8 @@ class JavaValidator:
                             error_line=line_num,
                         )
                     err = self._invoke_method(
-                        called_meth, raw_args, clean_code, scope, scopes, symbols, next_id,
-                        methods_info, instructions, cleaned_statements, class_name, main_class_id,
+                        called_meth, raw_args, clean_code, scope, scopes, register_symbol, sym_by_id,
+                        next_id, methods_info, instructions, cleaned_statements, class_name, main_class_id,
                         line_num, emitted_methods
                     )
                     if err:
@@ -468,7 +498,6 @@ class JavaValidator:
                     cleaned_statements.append(f"SOUT {main_class_id}.{m_sym.id_code}")
                     continue
 
-                # Llamada mediante instancia declarada: System.out.println(tienda.calcular(...));
                 m_inst_call = re.match(r"^([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\((.*)\)$", inner)
                 if m_inst_call and m_inst_call.group(2) in methods_info:
                     obj_name, called_meth, raw_args = m_inst_call.groups()
@@ -481,8 +510,8 @@ class JavaValidator:
                             error_line=line_num,
                         )
                     err = self._invoke_method(
-                        called_meth, raw_args, clean_code, scope, scopes, symbols, next_id,
-                        methods_info, instructions, cleaned_statements, class_name, main_class_id,
+                        called_meth, raw_args, clean_code, scope, scopes, register_symbol, sym_by_id,
+                        next_id, methods_info, instructions, cleaned_statements, class_name, main_class_id,
                         line_num, emitted_methods
                     )
                     if err:
@@ -563,8 +592,8 @@ class JavaValidator:
                         error_line=line_num,
                     )
                 err = self._invoke_method(
-                    called_meth, raw_args, clean_code, scope, scopes, symbols, next_id,
-                    methods_info, instructions, cleaned_statements, class_name, main_class_id,
+                    called_meth, raw_args, clean_code, scope, scopes, register_symbol, sym_by_id,
+                    next_id, methods_info, instructions, cleaned_statements, class_name, main_class_id,
                     line_num, emitted_methods
                 )
                 if err:
@@ -600,6 +629,14 @@ class JavaValidator:
                         errors=[f"Error en línea {line_num}: {err}"],
                         error_line=line_num,
                     )
+                type_err = self._check_assignment_types(method_entry.data_type, resolved_expr, sym_by_id)
+                if type_err:
+                    return ExtendedValidationResult(
+                        is_valid=False,
+                        class_name=class_name,
+                        errors=[f"Error semántico en línea {line_num}: {type_err}"],
+                        error_line=line_num,
+                    )
                 instructions.append(
                     IRInstruction(
                         kind="RTN",
@@ -613,7 +650,7 @@ class JavaValidator:
                 cleaned_statements.append(f"RETURN {resolved_expr}")
                 continue
 
-            # 4. Declaración local: tipo nombre [= expr]; (incluye objetos como Tienda tienda = new Tienda();)
+            # 4. Declaración local: tipo nombre [= expr];
             m_decl = re.match(r"^(?:final\s+)?([A-Za-z_]\w*)\s+([A-Za-z_]\w*)(?:\s*=\s*(.+))?$", stmt)
             if m_decl:
                 var_type, var_name, expr = m_decl.groups()
@@ -641,15 +678,16 @@ class JavaValidator:
                             errors=[f"Error semántico en línea {line_num}: inicialización inválida '{init_raw}' para '{class_name}'."],
                             error_line=line_num,
                         )
-                    obj_entry = SymbolEntry(
-                        id_code=next_id(),
-                        lexeme=var_name,
-                        category="Objeto Local",
-                        data_type=class_name,
-                        scope=scope,
-                        initial_value=init_raw,
+                    obj_entry = register_symbol(
+                        SymbolEntry(
+                            id_code=next_id(),
+                            lexeme=var_name,
+                            category="Objeto Local",
+                            data_type=class_name,
+                            scope=scope,
+                            initial_value=init_raw,
+                        )
                     )
-                    symbols.append(obj_entry)
                     scopes[scope][var_name] = obj_entry
                     instructions.append(
                         IRInstruction(
@@ -664,17 +702,6 @@ class JavaValidator:
                     continue
 
                 init_val = expr.strip() if expr is not None else self.DEFAULT_VALUES[var_type]
-                local_entry = SymbolEntry(
-                    id_code=next_id(),
-                    lexeme=var_name,
-                    category="Variable Local",
-                    data_type=var_type,
-                    scope=scope,
-                    initial_value=init_val,
-                )
-                symbols.append(local_entry)
-                scopes[scope][var_name] = local_entry
-
                 resolved_expr, err = self._resolve_expression(init_val, scope, scopes, class_name, main_class_id)
                 if err:
                     return ExtendedValidationResult(
@@ -683,6 +710,26 @@ class JavaValidator:
                         errors=[f"Error en línea {line_num}: {err}"],
                         error_line=line_num,
                     )
+                type_err = self._check_assignment_types(var_type, resolved_expr, sym_by_id)
+                if type_err:
+                    return ExtendedValidationResult(
+                        is_valid=False,
+                        class_name=class_name,
+                        errors=[f"Error semántico en línea {line_num}: {type_err}"],
+                        error_line=line_num,
+                    )
+
+                local_entry = register_symbol(
+                    SymbolEntry(
+                        id_code=next_id(),
+                        lexeme=var_name,
+                        category="Variable Local",
+                        data_type=var_type,
+                        scope=scope,
+                        initial_value=init_val,
+                    )
+                )
+                scopes[scope][var_name] = local_entry
                 instructions.append(
                     IRInstruction(
                         kind="ASSIGN",
@@ -715,6 +762,14 @@ class JavaValidator:
                         errors=[f"Error en línea {line_num}: {err}"],
                         error_line=line_num,
                     )
+                type_err = self._check_assignment_types(sym.data_type, resolved_expr, sym_by_id)
+                if type_err:
+                    return ExtendedValidationResult(
+                        is_valid=False,
+                        class_name=class_name,
+                        errors=[f"Error semántico en línea {line_num}: {type_err}"],
+                        error_line=line_num,
+                    )
                 instructions.append(
                     IRInstruction(
                         kind="ASSIGN",
@@ -743,7 +798,8 @@ class JavaValidator:
         clean_code: str,
         caller_scope: str,
         scopes: Dict[str, Dict[str, SymbolEntry]],
-        symbols: List[SymbolEntry],
+        register_symbol,
+        sym_by_id: Dict[str, SymbolEntry],
         next_id,
         methods_info: Dict[str, dict],
         instructions: List[IRInstruction],
@@ -774,6 +830,14 @@ class JavaValidator:
                     errors=[f"Error en línea {line_num}: {err}"],
                     error_line=line_num,
                 )
+            type_err = self._check_assignment_types(p_sym.data_type, resolved_arg, sym_by_id)
+            if type_err:
+                return ExtendedValidationResult(
+                    is_valid=False,
+                    class_name=class_name,
+                    errors=[f"Error semántico en línea {line_num}: {type_err}"],
+                    error_line=line_num,
+                )
             instructions.append(
                 IRInstruction(
                     kind="ASSIGN",
@@ -793,7 +857,8 @@ class JavaValidator:
                 end_idx=minfo["body_end"],
                 scope=called_meth,
                 scopes=scopes,
-                symbols=symbols,
+                register_symbol=register_symbol,
+                sym_by_id=sym_by_id,
                 next_id=next_id,
                 instructions=instructions,
                 cleaned_statements=cleaned_statements,
@@ -824,13 +889,13 @@ class JavaValidator:
         if not expr:
             return "", "expresión vacía."
 
-        no_strings = re.sub(r'"[^"]*"|\'[^\']*\'', "STR", expr)
-        if re.match(r"^[*/%+]", no_strings) or re.search(r"[+\-*/%=!]$", no_strings):
+        no_strings = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', "STR", expr)
+        if re.match(r"^(?:[*/%+]|>=|<=|==|!=|<|>)", no_strings) or re.search(r"(?:[+\-*/%=!<>]|>=|<=|==|!=)$", no_strings):
             return "", f"expresión mal formada '{expr}'."
         if re.search(r"[*/%]\s*[+\-*/%]", no_strings) or re.search(r"[+\-]\s*[*/%]", no_strings):
             return "", f"operadores consecutivos inválidos en '{expr}'."
 
-        token_pattern = re.compile(r'"[^"]*"|\'[^\']*\'|\b[A-Za-z_]\w*\b')
+        token_pattern = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|\b[A-Za-z_]\w*\b')
         error_msg: Optional[str] = None
 
         def replacer(match: re.Match) -> str:
@@ -853,13 +918,146 @@ class JavaValidator:
             return "", error_msg
         return resolved, None
 
-    def _strip_comments_preserve_lines(self, code: str) -> str:
-        def block_repl(m: re.Match) -> str:
-            return "\n" * m.group(0).count("\n")
+    def _check_assignment_types(
+        self,
+        target_type: str,
+        resolved_expr: str,
+        sym_by_id: Dict[str, SymbolEntry],
+    ) -> Optional[str]:
+        expr_type = self._infer_expr_type(resolved_expr, sym_by_id)
+        if expr_type is None:
+            return None
 
-        code = re.sub(r"/\*[\s\S]*?\*/", block_repl, code)
-        code = re.sub(r"//.*", "", code)
-        return code
+        if target_type == "boolean":
+            if expr_type != "boolean":
+                return f"tipos incompatibles: no se puede asignar '{expr_type}' a 'boolean'."
+            return None
+
+        if target_type == "String":
+            if expr_type != "String":
+                return f"tipos incompatibles: no se puede asignar '{expr_type}' a 'String'."
+            return None
+
+        if target_type == "char":
+            if expr_type != "char":
+                return f"tipos incompatibles: no se puede asignar '{expr_type}' a 'char'."
+            return None
+
+        if target_type in self.NUMERIC_TYPES:
+            if expr_type not in self.NUMERIC_TYPES:
+                return f"tipos incompatibles: no se puede asignar '{expr_type}' a '{target_type}'."
+            widening = {
+                "double": {"double", "float", "long", "int", "short", "byte", "char"},
+                "float": {"float", "long", "int", "short", "byte", "char"},
+                "long": {"long", "int", "short", "byte", "char"},
+                "int": {"int", "short", "byte", "char"},
+                "short": {"short", "byte"},
+                "byte": {"byte"},
+            }
+            if target_type == "byte" and expr_type == "int" and re.match(r"^-?\d+$", resolved_expr.strip()):
+                val = int(resolved_expr.strip())
+                if -128 <= val <= 127:
+                    return None
+            if expr_type not in widening.get(target_type, {target_type}):
+                return f"tipos incompatibles: pérdida de precisión de '{expr_type}' a '{target_type}'."
+        return None
+
+    def _infer_expr_type(self, expr: str, sym_by_id: Dict[str, SymbolEntry]) -> Optional[str]:
+        s = re.sub(r"\(\s*(?:float|double|int|char|long|short|byte|boolean)\s*\)", "", expr).strip()
+        if re.search(r"(?:>=|<=|==|!=|<|>)", s) or s.startswith("!"):
+            return "boolean"
+        if s in ("true", "false"):
+            return "boolean"
+        if re.match(r'^"(?:\\.|[^"\\])*"$', s):
+            return "String"
+        if re.match(r"^'(?:\\.|[^'\\])*'$", s):
+            return "char"
+        if re.match(r"^-?\d+(?:\.\d+)?[fF]$", s):
+            return "float"
+        if re.match(r"^-?\d+\.\d+$", s):
+            return "double"
+        if re.match(r"^-?\d+$", s):
+            return "int"
+
+        tokens = re.findall(
+            r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|\d+\.\d+[fF]?|\d+[fF]?|\.[A-Za-z_]\w*\(\)|[A-Za-z_]\w*',
+            s,
+        )
+        inferred: Set[str] = set()
+        for t in tokens:
+            if t.startswith('"'):
+                inferred.add("String")
+            elif t.startswith("'"):
+                inferred.add("char")
+            elif t in ("true", "false"):
+                inferred.add("boolean")
+            elif t.lower().endswith("f") and re.match(r"^\d", t):
+                inferred.add("float")
+            elif "." in t and re.match(r"^\d", t):
+                inferred.add("double")
+            elif re.match(r"^\d+$", t):
+                inferred.add("int")
+            elif t == ".length()":
+                inferred.clear()
+                inferred.add("int")
+            elif t == "random":
+                inferred.add("double")
+            elif t in sym_by_id:
+                dt = sym_by_id[t].data_type
+                if dt in self.VALID_TYPES:
+                    inferred.add(dt)
+
+        if "String" in inferred:
+            return "String"
+        if "boolean" in inferred:
+            return "boolean" if len(inferred) == 1 else "invalid"
+        if "double" in inferred:
+            return "double"
+        if "float" in inferred:
+            return "float"
+        if "long" in inferred:
+            return "long"
+        if "int" in inferred:
+            return "int"
+        if "char" in inferred and len(inferred) == 1:
+            return "char"
+        if "byte" in inferred and len(inferred) == 1:
+            return "byte"
+        return None
+
+    def _strip_comments_preserve_lines(self, code: str) -> str:
+        """Elimina // y /* ... */ ignorando los que estén dentro de cadenas o caracteres."""
+        pattern = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|/\*[\s\S]*?\*/|//[^\n]*')
+
+        def repl(m: re.Match) -> str:
+            tok = m.group(0)
+            if tok.startswith('"') or tok.startswith("'"):
+                return tok
+            if tok.startswith("/*"):
+                return "\n" * tok.count("\n")
+            return ""
+
+        return pattern.sub(repl, code)
+
+    def _find_unclosed_quotes(self, code: str) -> Optional[int]:
+        for line_no, line in enumerate(code.splitlines(), start=1):
+            in_str = False
+            in_chr = False
+            esc = False
+            for ch in line:
+                if esc:
+                    esc = False
+                    continue
+                if ch == "\\":
+                    esc = True
+                    continue
+                if ch == '"' and not in_chr:
+                    in_str = not in_str
+                elif ch == "'" and not in_str:
+                    in_chr = not in_chr
+            if in_str or in_chr:
+                return line_no
+        return None
 
     def _find_matching_brace(self, code: str, open_idx: int) -> Optional[int]:
         depth = 0
@@ -873,7 +1071,7 @@ class JavaValidator:
         return None
 
     def _find_illegal_chars(self, code: str) -> Optional[int]:
-        cleaned = re.sub(r'"[^"\n]*"|\'[^\'\n]*\'', "", code)
+        cleaned = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', "", code)
         for line_no, line in enumerate(cleaned.splitlines(), start=1):
             if re.search(r"[@$#¿?¡]", line):
                 return line_no

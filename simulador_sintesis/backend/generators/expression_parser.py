@@ -27,10 +27,16 @@ class ExprNode:
 
 
 class ExpressionParser:
-    PRECEDENCE = {"+": 1, "-": 1, "*": 2, "/": 2, "%": 2, ".": 3, "!": 4}
+    PRECEDENCE = {
+        "==": 0, "!=": 0, "<": 0, ">": 0, "<=": 0, ">=": 0,
+        "+": 1, "-": 1,
+        "*": 2, "/": 2, "%": 2,
+        ".": 3,
+        "!": 4,
+    }
 
     TOKEN_REGEX = re.compile(
-        r'"[^"]*"|\'[^\']*\'|\d+\.\d+[fF]?|\d+[fF]?|\+\+|--|[A-Za-z_]\w*(?:\(\))?|[+\-*/%.!()]'
+        r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|\d+\.\d+[fF]?|\d+[fF]?|\+\+|--|>=|<=|==|!=|[A-Za-z_]\w*(?:\(\))?|[+\-*/%.!<>()]'
     )
 
     @classmethod
@@ -50,7 +56,9 @@ class ExpressionParser:
         raw_tokens = cls.TOKEN_REGEX.findall(expr)
         tokens: List[str] = []
         for i, tok in enumerate(raw_tokens):
-            if tok == "-" and (i == 0 or raw_tokens[i - 1] in ("(", "+", "-", "*", "/", "%", "!")):
+            if tok == "-" and (
+                i == 0 or raw_tokens[i - 1] in ("(", "+", "-", "*", "/", "%", "!", ">=", "<=", "==", "!=", "<", ">")
+            ):
                 tokens.append("0")
                 tokens.append("-")
             else:
