@@ -8,9 +8,9 @@ from backend.entities.validation_result import ValidationResult
 @dataclass
 class IRInstruction:
     """Instrucción intermedia normalizada con IDs resueltos por ámbito."""
-    kind: str                  # ASSIGN, SOUT, RTN, CALL, CALL_SOUT
+    kind: str                  # ASSIGN, NEW_OBJ, SOUT, RTN, CALL, CALL_SOUT
     target_id: str             # Ej. ID2, PMAIN, ID4
-    target_type: str           # int, float, double, char, String, boolean, void
+    target_type: str           # int, float, double, char, String, boolean, void, o nombre de clase
     expr: str                  # Expresión con nombres originales reescritos a IDx
     scope: str                 # Global o nombre del método
     method_owner_id: str = ""  # ID del método si pertenece a un método auxiliar
@@ -176,7 +176,7 @@ class JavaValidator:
             )
             if m_method:
                 ret_type, meth_name, params_str = m_method.groups()
-                if ret_type not in self.RETURN_TYPES:
+                if ret_type not in self.RETURN_TYPES and ret_type != class_name:
                     return ExtendedValidationResult(
                         is_valid=False,
                         class_name=class_name,
@@ -206,7 +206,7 @@ class JavaValidator:
                 if params_str.strip():
                     for p in params_str.split(","):
                         pm = re.match(r"^\s*([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*$", p)
-                        if not pm or pm.group(1) not in self.VALID_TYPES:
+                        if not pm or (pm.group(1) not in self.VALID_TYPES and pm.group(1) != class_name):
                             return ExtendedValidationResult(
                                 is_valid=False,
                                 class_name=class_name,
@@ -301,7 +301,6 @@ class JavaValidator:
         cleaned_statements: List[str] = []
         emitted_methods: Set[str] = set()
 
-        # 1. Atributos globales (se inicializan primero al instanciar la clase)
         for attr_entry, init_expr, lnum in global_decls:
             resolved_expr, err = self._resolve_expression(init_expr, "Global", scopes, class_name, main_class_id)
             if err:
@@ -322,7 +321,6 @@ class JavaValidator:
             )
             cleaned_statements.append(f"{attr_entry.id_code} = {resolved_expr}")
 
-        # 2. Registrar parámetro args de main y procesar cuerpo de main (expande llamadas en orden real)
         m_start, m_end, arg_name, main_line = main_block_info
         scopes["main"] = {}
         args_entry = SymbolEntry(
@@ -354,7 +352,6 @@ class JavaValidator:
         if err_res is not None:
             return err_res
 
-        # 3. Validar/emitir métodos auxiliares que no hayan sido invocados desde main
         for meth_name, minfo in methods_info.items():
             if meth_name not in emitted_methods:
                 emitted_methods.add(meth_name)
@@ -471,6 +468,38 @@ class JavaValidator:
                     cleaned_statements.append(f"SOUT {main_class_id}.{m_sym.id_code}")
                     continue
 
+                # Llamada mediante instancia declarada: System.out.println(tienda.calcular(...));
+                m_inst_call = re.match(r"^([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\((.*)\)$", inner)
+                if m_inst_call and m_inst_call.group(2) in methods_info:
+                    obj_name, called_meth, raw_args = m_inst_call.groups()
+                    obj_sym = self._lookup_symbol(obj_name, scope, scopes)
+                    if obj_sym is None or obj_sym.data_type != class_name:
+                        return ExtendedValidationResult(
+                            is_valid=False,
+                            class_name=class_name,
+                            errors=[f"Error semántico en línea {line_num}: objeto '{obj_name}' no válido."],
+                            error_line=line_num,
+                        )
+                    err = self._invoke_method(
+                        called_meth, raw_args, clean_code, scope, scopes, symbols, next_id,
+                        methods_info, instructions, cleaned_statements, class_name, main_class_id,
+                        line_num, emitted_methods
+                    )
+                    if err:
+                        return err
+                    m_sym = methods_info[called_meth]["entry"]
+                    instructions.append(
+                        IRInstruction(
+                            kind="CALL_SOUT",
+                            target_id=obj_sym.id_code,
+                            target_type=m_sym.data_type,
+                            expr=m_sym.id_code,
+                            scope=scope,
+                        )
+                    )
+                    cleaned_statements.append(f"SOUT {obj_sym.id_code}.{m_sym.id_code}")
+                    continue
+
                 m_obj_attr = re.match(
                     rf"^new\s+{re.escape(class_name)}\s*\(\s*\)\s*\.\s*([A-Za-z_]\w*)$",
                     inner,
@@ -584,11 +613,11 @@ class JavaValidator:
                 cleaned_statements.append(f"RETURN {resolved_expr}")
                 continue
 
-            # 4. Declaración local: tipo nombre [= expr];
+            # 4. Declaración local: tipo nombre [= expr]; (incluye objetos como Tienda tienda = new Tienda();)
             m_decl = re.match(r"^(?:final\s+)?([A-Za-z_]\w*)\s+([A-Za-z_]\w*)(?:\s*=\s*(.+))?$", stmt)
             if m_decl:
                 var_type, var_name, expr = m_decl.groups()
-                if var_type not in self.VALID_TYPES:
+                if var_type not in self.VALID_TYPES and var_type != class_name:
                     return ExtendedValidationResult(
                         is_valid=False,
                         class_name=class_name,
@@ -602,6 +631,38 @@ class JavaValidator:
                         errors=[f"Error semántico en línea {line_num}: variable local '{var_name}' duplicada en '{scope}'."],
                         error_line=line_num,
                     )
+
+                if var_type == class_name:
+                    init_raw = expr.strip() if expr is not None else "null"
+                    if expr is not None and not re.match(rf"^new\s+{re.escape(class_name)}\s*\(\s*\)$", init_raw):
+                        return ExtendedValidationResult(
+                            is_valid=False,
+                            class_name=class_name,
+                            errors=[f"Error semántico en línea {line_num}: inicialización inválida '{init_raw}' para '{class_name}'."],
+                            error_line=line_num,
+                        )
+                    obj_entry = SymbolEntry(
+                        id_code=next_id(),
+                        lexeme=var_name,
+                        category="Objeto Local",
+                        data_type=class_name,
+                        scope=scope,
+                        initial_value=init_raw,
+                    )
+                    symbols.append(obj_entry)
+                    scopes[scope][var_name] = obj_entry
+                    instructions.append(
+                        IRInstruction(
+                            kind="NEW_OBJ",
+                            target_id=obj_entry.id_code,
+                            target_type=class_name,
+                            expr=f"new {main_class_id}",
+                            scope=scope,
+                        )
+                    )
+                    cleaned_statements.append(f"{obj_entry.id_code} = new {main_class_id}")
+                    continue
+
                 init_val = expr.strip() if expr is not None else self.DEFAULT_VALUES[var_type]
                 local_entry = SymbolEntry(
                     id_code=next_id(),
@@ -704,7 +765,6 @@ class JavaValidator:
                 ],
                 error_line=line_num,
             )
-        # 1. Asignar argumentos a parámetros (ej. ID5 = '@')
         for p_sym, arg_expr in zip(params, arg_list):
             resolved_arg, err = self._resolve_expression(arg_expr, caller_scope, scopes, class_name, main_class_id)
             if err:
@@ -725,7 +785,6 @@ class JavaValidator:
             )
             cleaned_statements.append(f"{p_sym.id_code} = {resolved_arg}")
 
-        # 2. Ejecutar/emitir el cuerpo del método llamado ya con los parámetros inicializados
         if called_meth not in emitted_methods:
             emitted_methods.add(called_meth)
             return self._parse_block_statements(
@@ -766,7 +825,7 @@ class JavaValidator:
             return "", "expresión vacía."
 
         no_strings = re.sub(r'"[^"]*"|\'[^\']*\'', "STR", expr)
-        if re.match(r"^[*/%+]", no_strings) or re.search(r"[+\-*/%=]$", no_strings):
+        if re.match(r"^[*/%+]", no_strings) or re.search(r"[+\-*/%=!]$", no_strings):
             return "", f"expresión mal formada '{expr}'."
         if re.search(r"[*/%]\s*[+\-*/%]", no_strings) or re.search(r"[+\-]\s*[*/%]", no_strings):
             return "", f"operadores consecutivos inválidos en '{expr}'."
