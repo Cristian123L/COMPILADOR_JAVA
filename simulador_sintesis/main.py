@@ -1,16 +1,8 @@
 from pathlib import Path
-from backend.validator.java_validator import JavaValidator
+from frontend.app_gui import SynthesisSimulatorApp
 
-BASE_DIR = Path(__file__).resolve().parent
-ruta_archivo = BASE_DIR / "samples" / "prueba_valida.java"
-
-with open(ruta_archivo, "r", encoding="utf-8") as f:
-    codigo = f.read()
-
-validador = JavaValidator()
-resultado = validador.validate(codigo)
-
-print("¿Es válido?:", resultado.is_valid)
-print("Clase:", resultado.class_name)
-print("Errores:", resultado.errors)
-print("Sentencias limpias:", resultado.cleaned_statements)
+if __name__ == "__main__":
+    base_dir = Path(__file__).resolve().parent
+    sample_file = base_dir / "samples" / "prueba_valida.java"
+    app = SynthesisSimulatorApp(initial_file=sample_file)
+    app.mainloop()

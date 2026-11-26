@@ -15,10 +15,8 @@ class JavaValidator:
         if not source_code or not source_code.strip():
             return ValidationResult(is_valid=False, errors=["El editor de código está vacío."])
 
-        # 1. Limpiar comentarios de línea (//) y de bloque (/* */)
         clean_code = self._strip_comments(source_code)
 
-        # 2. Verificar balance de llaves y paréntesis
         if clean_code.count("{") != clean_code.count("}"):
             errors.append("Error de sintaxis: llaves '{' y '}' desbalanceadas.")
         if clean_code.count("(") != clean_code.count(")"):
@@ -27,7 +25,6 @@ class JavaValidator:
         if errors:
             return ValidationResult(is_valid=False, errors=errors)
 
-        # 3. Verificar declaración de clase principal: public class NombreClase { ... }
         class_match = re.search(
             r"\bpublic\s+class\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{",
             clean_code
@@ -38,7 +35,6 @@ class JavaValidator:
 
         class_name = class_match.group(1)
 
-        # 4. Verificar método main: public static void main(String[] args)
         main_pattern = re.compile(
             r"\bpublic\s+static\s+void\s+main\s*\(\s*String\s*(?:\[\s*\]\s*[A-Za-z_]\w*|[A-Za-z_]\w*\s*\[\s*\])\s*\)\s*\{"
         )
@@ -47,7 +43,6 @@ class JavaValidator:
             errors.append("La clase principal debe contener el método 'public static void main(String[] args)'.")
             return ValidationResult(is_valid=False, class_name=class_name, errors=errors)
 
-        # 5. Extraer el cuerpo dentro del método main y validar cada instrucción
         main_body = self._extract_block_content(clean_code, main_match.end() - 1)
         if main_body is None:
             errors.append("No se pudo delimitar el bloque del método main.")
@@ -91,7 +86,6 @@ class JavaValidator:
         declared_vars = set()
 
         for idx, line in enumerate(lines, start=1):
-            # Ignorar impresiones en consola si las hay, pero exigir punto y coma
             if not line.endswith(";"):
                 errors.append(f"Línea {idx} dentro de main ('{line}'): falta punto y coma ';' al final.")
                 continue
@@ -100,8 +94,14 @@ class JavaValidator:
             if not stmt:
                 continue
 
-            # Ignorar System.out.println(...) para no romper si el archivo de prueba imprime resultados
-            if stmt.startswith("System.out.print"):
+            # Detectar System.out.println(...) o System.out.print(...) para rastrear uso real de variables (CM)
+            print_match = re.match(r"^System\.out\.print(?:ln)?\s*\((.+)\)$", stmt)
+            if print_match:
+                expr = print_match.group(1).strip()
+                if not self._is_valid_expression(expr):
+                    errors.append(f"Expresión inválida en impresión '{expr}' en '{line}'.")
+                    continue
+                cleaned.append(f"PRINT {expr}")
                 continue
 
             # Caso A: Declaración con o sin inicialización -> ej: int a = 5 + 3; o int x;
@@ -143,13 +143,10 @@ class JavaValidator:
         expr = expr.strip()
         if not expr:
             return False
-        # No debe empezar o terminar con operador binario
         if re.match(r"^[*/%+]", expr) or re.search(r"[+\-*/%=]$", expr):
             return False
-        # No debe tener dos operadores binarios seguidos (ej. a + * b)
         if re.search(r"[+\-*/%]\s*[+\-*/%]", expr):
             return False
-        # Caracteres permitidos en expresiones aritméticas/variables/literales
         if not re.match(r"^[A-Za-z0-9_.\s+\-*/%()\"']+$", expr):
             return False
         return True
