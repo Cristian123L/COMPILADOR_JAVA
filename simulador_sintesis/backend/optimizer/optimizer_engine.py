@@ -205,7 +205,7 @@ class OptimizerEngine:
         new_idx = 1
 
         for inst in ops:
-            afectados = ", ".join(sorted(inst["affected"], key=lambda x: int(x))) if inst["affected"] else "-"
+            afectados = str(min(int(x) for x in inst["affected"])) if inst["affected"] else "-"
 
             if inst["eliminated"]:
                 if inst["modified_by_cascade"]:

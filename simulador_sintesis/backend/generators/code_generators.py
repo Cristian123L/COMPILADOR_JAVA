@@ -57,14 +57,18 @@ class ExecStepNode:
 
 class IntermediateCodeGenerator:
     """
-    Genera Códigos Intermedios recorriendo el Árbol Abstracto-Semántico
-    de abajo hacia arriba y de izquierda a derecha (Unidad 2):
+    Genera Códigos Intermedios recorriendo el Árbol Abstracto-Semántico:
       - Triplos:          n. (val1, ope, val2) + ID1 PMAIN -> [n]
       - Cuádruplos:       n. (val1, ope, val2, res) + ID1 PMAIN -> [n]
-      - Tres Direcciones: Tn. (val1, ope, val2) con 1 <= n <= 3
+      - Tres Direcciones: Tn. (val1, ope, val2) con 1 <= n <= 3,
+                          dejando operaciones pendientes hasta liberar temporales.
     """
 
-    def _build_bottom_up_plan(self, instructions: List[IRInstruction]) -> List[ExecStepNode]:
+    def _build_bottom_up_plan(
+        self,
+        instructions: List[IRInstruction],
+        defer_pending_for_3dir: bool = False,
+    ) -> List[ExecStepNode]:
         uid_counter = 0
 
         def next_uid() -> int:
@@ -182,6 +186,47 @@ class IntermediateCodeGenerator:
         roots = [n for n in inst_nodes if n.uid not in expanded_defs]
         ordered_nodes: List[ExecStepNode] = []
         visited: Set[int] = set()
+
+        if defer_pending_for_3dir:
+            def reg_demand(node: Optional[ExecStepNode]) -> int:
+                if node is None:
+                    return 0
+                if node.kind == "OP":
+                    l_req = reg_demand(node.left_node)
+                    r_req = reg_demand(node.right_node)
+                    if l_req == 0 and r_req == 0:
+                        return 1
+                    return max(l_req, r_req) + 1 if l_req == r_req else max(l_req, r_req)
+                if node.right_node is not None:
+                    return reg_demand(node.right_node)
+                return 0
+
+            def emit_postorder_3dir(node: ExecStepNode, acc: List[ExecStepNode]):
+                if node.uid in visited:
+                    return
+                visited.add(node.uid)
+                if node.kind == "OP":
+                    l_req = reg_demand(node.left_node)
+                    r_req = reg_demand(node.right_node)
+                    if r_req > l_req:
+                        if node.right_node is not None:
+                            emit_postorder_3dir(node.right_node, acc)
+                        if node.left_node is not None:
+                            emit_postorder_3dir(node.left_node, acc)
+                    else:
+                        if node.left_node is not None:
+                            emit_postorder_3dir(node.left_node, acc)
+                        if node.right_node is not None:
+                            emit_postorder_3dir(node.right_node, acc)
+                else:
+                    for child in node.children:
+                        emit_postorder_3dir(child, acc)
+                acc.append(node)
+
+            for root in roots:
+                emit_postorder_3dir(root, ordered_nodes)
+            return ordered_nodes
+
         lr_counter = 0
 
         def collect(node: ExecStepNode, root_id: int, depth: int, acc: List[ExecStepNode]):
@@ -210,7 +255,7 @@ class IntermediateCodeGenerator:
         instructions: List[IRInstruction],
         main_class_id: str = "ID1",
     ) -> Tuple[List[Triplo], str]:
-        plan = self._build_bottom_up_plan(instructions)
+        plan = self._build_bottom_up_plan(instructions, defer_pending_for_3dir=False)
         triplos: List[Triplo] = []
         node_ref: Dict[int, str] = {}
         last_id_ref: Dict[str, str] = {}
@@ -254,7 +299,7 @@ class IntermediateCodeGenerator:
         symbols: List[SymbolEntry],
         main_class_id: str = "ID1",
     ) -> Tuple[List[Cuadruplo], str]:
-        plan = self._build_bottom_up_plan(instructions)
+        plan = self._build_bottom_up_plan(instructions, defer_pending_for_3dir=False)
         cuadruplos: List[Cuadruplo] = []
         node_ref: Dict[int, str] = {}
         node_val: Dict[int, TypedVal] = {}
@@ -349,15 +394,15 @@ class IntermediateCodeGenerator:
     ) -> Tuple[List[TresDirecciones], str]:
         """
         Genera Código de Tres Direcciones restringido estrictamente a 3 registros (1 <= n <= 3):
-          - Mientras se evalúan subexpresiones, los registros ocupados no se sobrescriben
-            en la misma instrucción (T1 -> T2 -> T3).
+          - Deja operaciones pendientes hasta liberar temporales (T1 -> T2 -> T3).
+          - Un registro consumido en una operación no se sobrescribe en esa misma línea,
+            pero queda libre inmediatamente después para las operaciones pendientes.
           - Las asignaciones a ID (`IDx = Tn`) y las salidas/retornos (`Tn. (IDx, SOUT/RTN, Tm)`)
             liberan los temporales utilizados.
         """
-        plan = self._build_bottom_up_plan(instructions)
+        plan = self._build_bottom_up_plan(instructions, defer_pending_for_3dir=True)
         salida: List[TresDirecciones] = []
         in_use: Set[int] = set()
-        consumed_in_expr: Set[int] = set()
         preferred_reg: Optional[int] = None
         node_holder: Dict[int, str] = {}
         node_reg: Dict[int, Optional[int]] = {}
@@ -370,14 +415,13 @@ class IntermediateCodeGenerator:
                 r1 = node_reg.get(node.left_node.uid) if node.left_node else None
                 r2 = node_reg.get(node.right_node.uid) if node.right_node else None
 
-                # Asignar un registro nuevo distinto de los que siguen activos (T1 -> T2 -> T3)
-                dest_reg = self._alloc_reg(in_use, consumed_in_expr, preferred_reg)
+                dest_reg = self._alloc_reg(in_use, preferred_reg)
                 preferred_reg = None
 
                 if r1 is not None:
-                    consumed_in_expr.add(r1)
+                    in_use.discard(r1)
                 if r2 is not None:
-                    consumed_in_expr.add(r2)
+                    in_use.discard(r2)
 
                 salida.append(TresDirecciones(registro=dest_reg, val1=v1, ope=node.ope, val2=v2))
                 node_holder[node.uid] = f"T{dest_reg}"
@@ -397,13 +441,8 @@ class IntermediateCodeGenerator:
                         is_direct_assign=True,
                     )
                 )
-                # Al asignar a un ID, se liberan los temporales de esa expresión
                 if r2 is not None:
                     in_use.discard(r2)
-                    consumed_in_expr.discard(r2)
-                for c_reg in list(consumed_in_expr):
-                    in_use.discard(c_reg)
-                consumed_in_expr.clear()
 
                 node_holder[node.uid] = node.target_id
                 node_reg[node.uid] = None
@@ -413,7 +452,7 @@ class IntermediateCodeGenerator:
                 v2 = node_holder[node.right_node.uid] if node.right_node else node.right_tok
                 r2 = node_reg.get(node.right_node.uid) if node.right_node else None
 
-                dest_reg = self._alloc_reg(in_use, consumed_in_expr, preferred_reg)
+                dest_reg = self._alloc_reg(in_use, preferred_reg)
                 salida.append(
                     TresDirecciones(
                         registro=dest_reg,
@@ -422,23 +461,21 @@ class IntermediateCodeGenerator:
                         val2=v2,
                     )
                 )
-                # SOUT / RTN actúa como '=': libera todos los temporales usados y deja libre r2
                 in_use.clear()
-                consumed_in_expr.clear()
                 preferred_reg = r2
 
                 node_holder[node.uid] = node.target_id
                 node_reg[node.uid] = None
-                last_holder = node.target_id
+                last_holder = f"T{dest_reg}"
 
             elif node.kind == "CALL":
                 v2 = node_holder[node.right_node.uid] if node.right_node else node.right_tok
                 r2 = node_reg.get(node.right_node.uid) if node.right_node else None
 
-                dest_reg = self._alloc_reg(in_use, consumed_in_expr, preferred_reg)
+                dest_reg = self._alloc_reg(in_use, preferred_reg)
                 preferred_reg = None
                 if r2 is not None:
-                    consumed_in_expr.add(r2)
+                    in_use.discard(r2)
 
                 salida.append(TresDirecciones(registro=dest_reg, val1=node.target_id, ope=".", val2=v2))
                 node_holder[node.uid] = f"T{dest_reg}"
@@ -448,10 +485,9 @@ class IntermediateCodeGenerator:
             elif node.kind == "CALL_SOUT":
                 v2 = node_holder[node.right_node.uid] if node.right_node else last_holder
 
-                dest_reg = self._alloc_reg(in_use, consumed_in_expr, preferred_reg)
+                dest_reg = self._alloc_reg(in_use, preferred_reg)
                 salida.append(TresDirecciones(registro=dest_reg, val1="PMAIN", ope="SOUT", val2=v2))
                 in_use.clear()
-                consumed_in_expr.clear()
                 preferred_reg = None
                 last_holder = f"T{dest_reg}"
 
@@ -461,19 +497,12 @@ class IntermediateCodeGenerator:
     def _alloc_reg(
         self,
         in_use: Set[int],
-        consumed_in_expr: Set[int],
         preferred_reg: Optional[int] = None,
     ) -> int:
         free = {1, 2, 3} - in_use
         if free:
             reg = preferred_reg if (preferred_reg is not None and preferred_reg in free) else min(free)
             in_use.add(reg)
-            return reg
-
-        # Si los 3 registros están ocupados, reciclar solo si alguno ya fue consumido en la expresión
-        if consumed_in_expr:
-            reg = min(consumed_in_expr)
-            consumed_in_expr.remove(reg)
             return reg
 
         raise ValueError(

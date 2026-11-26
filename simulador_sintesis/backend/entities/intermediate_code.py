@@ -3,7 +3,6 @@ from dataclasses import dataclass
 
 @dataclass
 class Triplo:
-    """Representa n. (val1, ope, val2) con n >= 1 sin límite de registros."""
     indice: int
     val1: str
     ope: str
@@ -15,7 +14,6 @@ class Triplo:
 
 @dataclass
 class Cuadruplo:
-    """Representa n. (val1, ope, val2, res) con n >= 1 sin límite de registros."""
     indice: int
     val1: str
     ope: str
@@ -28,12 +26,6 @@ class Cuadruplo:
 
 @dataclass
 class TresDirecciones:
-    """
-    Representa instrucciones de Tres Direcciones con restricción 1 <= n <= 3:
-    - Asignación directa: ID2 = 3  o  ID3 = T1
-    - Operación temporal: T1. (ID2, +, 1)
-    - Retorno / Salida:   ID4 SOUT T2  o  ID4 RTN T1
-    """
     registro: int
     val1: str
     ope: str
